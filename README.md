@@ -50,6 +50,9 @@ A single app is a single group with one entry. Status is reported per group and 
 
 ## Behavior
 
+- **No auto-sync.** Applications in an ApplicationSync or an ApplicationSyncPolicy must not have auto-sync
+  enabled. Auto-sync would sync an app ahead of the groups it depends on, or undo a pinned revision. To keep a
+  group of apps in sync automatically, use an ApplicationSyncPolicy instead.
 - **Waiting.** An app that doesn't exist yet, or already has an operation running, waits.
 - **Health gate.** An app is done once its sync succeeded and it is Synced and Healthy. That status is only
   trusted once `status.sync.comparedTo` shows the app's current spec, and the controller requests a refresh
@@ -81,9 +84,6 @@ for writing `operation` with kubectl today. With `application.sync.requireOverri
 
 A prototype of this ran inside Argo CD's application controller. Running outside it means:
 
-- **No auto-sync hold.** Inside Argo CD, auto-sync was paused for apps an unfinished ApplicationSync hadn't synced
-  yet. Out here, turn auto-sync off on apps whose order matters, as ApplicationSet RollingSync requires, or an
-  auto-sync can run an app ahead of its dependencies.
 - **Revisions are passed as given.** There is no repo-server access to resolve a branch to a commit.
 - **Syncs from Argo CD's API and UI aren't recorded** as ApplicationSyncs, and ApplicationSet RollingSync is not
   replaced.
