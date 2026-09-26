@@ -1,0 +1,430 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: applicationsyncs.argoproj.io
+spec:
+  group: argoproj.io
+  names:
+    kind: ApplicationSync
+    listKind: ApplicationSyncList
+    plural: applicationsyncs
+    shortNames:
+    - appsync
+    - appsyncs
+    singular: applicationsync
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.message
+      name: Message
+      priority: 10
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: ApplicationSync requests a one-off sync of groups of Applications
+          in its namespace, ordered by group dependsOn.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: Every field except paused is immutable. CEL can't compare
+              a struct minus one field, so each is listed.
+            properties:
+              doneWhen:
+                description: 'DoneWhen decides when an app counts as done: SyncedAndHealthy
+                  (default) or Healthy'
+                enum:
+                - SyncedAndHealthy
+                - Healthy
+                type: string
+              dryRun:
+                description: DryRun specifies to perform a `kubectl apply --dry-run`
+                  without actually performing the sync
+                type: boolean
+              groups:
+                description: |-
+                  Groups of Applications to sync. A group starts once the groups it depends on have succeeded, and its
+                  apps sync in parallel. The apps must be in the same namespace as the ApplicationSync.
+                items:
+                  description: ApplicationSyncGroup is a set of Applications synced
+                    in parallel, after the groups it depends on.
+                  properties:
+                    apps:
+                      description: Apps to sync in this group. A group with no apps
+                        counts as complete.
+                      items:
+                        description: ApplicationSyncApp is an Application to sync.
+                        properties:
+                          name:
+                            description: Name of the Application
+                            minLength: 1
+                            type: string
+                          prune:
+                            description: Prune overrides spec.prune for this app
+                            type: boolean
+                          resources:
+                            description: Resources limits the sync to these resources,
+                              as in the Sync API
+                            items:
+                              description: SyncOperationResource contains resources
+                                to sync.
+                              properties:
+                                group:
+                                  type: string
+                                kind:
+                                  type: string
+                                name:
+                                  type: string
+                                namespace:
+                                  type: string
+                              required:
+                              - kind
+                              - name
+                              type: object
+                            type: array
+                          retry:
+                            description: Retry overrides spec.retry and the app's
+                              own syncPolicy.retry for this app
+                            properties:
+                              backoff:
+                                description: Backoff controls how to backoff on subsequent
+                                  retries of failed syncs
+                                properties:
+                                  duration:
+                                    description: Duration is the amount to back off.
+                                      Default unit is seconds, but could also be a
+                                      duration (e.g. "2m", "1h")
+                                    type: string
+                                  factor:
+                                    description: Factor is a factor to multiply the
+                                      base duration after each failed retry
+                                    format: int64
+                                    type: integer
+                                  maxDuration:
+                                    description: MaxDuration is the maximum amount
+                                      of time allowed for the backoff strategy
+                                    type: string
+                                type: object
+                              limit:
+                                description: Limit is the maximum number of attempts
+                                  for retrying a failed sync. If set to 0, no retries
+                                  will be performed.
+                                format: int64
+                                type: integer
+                              refresh:
+                                description: 'Refresh indicates if the latest revision
+                                  should be used on retry instead of the initial one
+                                  (default: false)'
+                                type: boolean
+                            type: object
+                          revisions:
+                            description: |-
+                              Revisions pins sources of the app. A source that isn't listed syncs to its targetRevision as resolved when
+                              the app's sync starts.
+                            items:
+                              description: ApplicationSyncRevision pins one source
+                                of an app. Single-source apps set neither Source nor
+                                Position.
+                              properties:
+                                position:
+                                  description: Position is the 1-based index of the
+                                    source in spec.sources
+                                  format: int32
+                                  minimum: 1
+                                  type: integer
+                                revision:
+                                  description: |-
+                                    Revision to sync the source to. It is passed to the sync as given, so use a commit SHA, an exact chart
+                                    version or a digest to be sure every app in the run gets the same one.
+                                  minLength: 1
+                                  type: string
+                                source:
+                                  description: Source is the name of the source in
+                                    spec.sources
+                                  type: string
+                              required:
+                              - revision
+                              type: object
+                              x-kubernetes-validations:
+                              - message: set source or position, not both
+                                rule: '!(has(self.source) && has(self.position))'
+                            type: array
+                        required:
+                        - name
+                        type: object
+                      type: array
+                      x-kubernetes-list-map-keys:
+                      - name
+                      x-kubernetes-list-type: map
+                    dependsOn:
+                      description: DependsOn names other groups whose apps must all
+                        be synced and Healthy before this group starts
+                      items:
+                        type: string
+                      type: array
+                      x-kubernetes-list-type: set
+                    maxParallel:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      description: |-
+                        MaxParallel caps how many apps in the group sync at once, as a number or a percentage of the group.
+                        A percentage that rounds down to 0 becomes 1, except 0%. 0 or 0% pauses the group.
+                      x-kubernetes-int-or-string: true
+                    name:
+                      description: Name of the group, unique within the ApplicationSync
+                      minLength: 1
+                      type: string
+                  required:
+                  - name
+                  type: object
+                minItems: 1
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+              info:
+                description: Info is added to each app's operation
+                items:
+                  properties:
+                    name:
+                      type: string
+                    value:
+                      type: string
+                  required:
+                  - name
+                  - value
+                  type: object
+                type: array
+              initiatedBy:
+                description: |-
+                  InitiatedBy is copied into each app's operation. It is informational only and never used for authorization.
+                  When Automated is true, sync windows are checked with automatic semantics.
+                properties:
+                  automated:
+                    description: Automated is set to true if operation was initiated
+                      automatically by the application controller.
+                    type: boolean
+                  username:
+                    description: Username contains the name of a user who started
+                      operation
+                    type: string
+                type: object
+              onFailure:
+                description: |-
+                  OnFailure decides what happens when an app fails: Fail (default) fails it and skips its dependents, Wait keeps
+                  it Progressing until it is done
+                enum:
+                - Fail
+                - Wait
+                type: string
+              paused:
+                description: |-
+                  Paused stops new app syncs from starting; syncs already running finish. It is the only field that can
+                  change after creation.
+                type: boolean
+              prune:
+                description: Prune specifies to delete resources from the cluster
+                  that are no longer tracked in git
+                type: boolean
+              retry:
+                description: Retry overrides each Application's spec.syncPolicy.retry
+                  when set
+                properties:
+                  backoff:
+                    description: Backoff controls how to backoff on subsequent retries
+                      of failed syncs
+                    properties:
+                      duration:
+                        description: Duration is the amount to back off. Default unit
+                          is seconds, but could also be a duration (e.g. "2m", "1h")
+                        type: string
+                      factor:
+                        description: Factor is a factor to multiply the base duration
+                          after each failed retry
+                        format: int64
+                        type: integer
+                      maxDuration:
+                        description: MaxDuration is the maximum amount of time allowed
+                          for the backoff strategy
+                        type: string
+                    type: object
+                  limit:
+                    description: Limit is the maximum number of attempts for retrying
+                      a failed sync. If set to 0, no retries will be performed.
+                    format: int64
+                    type: integer
+                  refresh:
+                    description: 'Refresh indicates if the latest revision should
+                      be used on retry instead of the initial one (default: false)'
+                    type: boolean
+                type: object
+              skipIfSynced:
+                description: SkipIfSynced counts an app that is already Synced at
+                  its revisions as synced, without starting a sync
+                type: boolean
+              syncOptions:
+                description: SyncOptions override each Application's spec.syncPolicy.syncOptions
+                  when set
+                items:
+                  type: string
+                type: array
+              syncStrategy:
+                description: SyncStrategy describes how to perform the sync
+                properties:
+                  apply:
+                    description: Apply will perform a `kubectl apply` to perform the
+                      sync.
+                    properties:
+                      force:
+                        description: |-
+                          Force indicates whether or not to supply the --force flag to `kubectl apply`.
+                          The --force flag deletes and re-create the resource, when PATCH encounters conflict and has
+                          retried for 5 times.
+                        type: boolean
+                    type: object
+                  hook:
+                    description: Hook will submit any referenced resources to perform
+                      the sync. This is the default strategy
+                    properties:
+                      force:
+                        description: |-
+                          Force indicates whether or not to supply the --force flag to `kubectl apply`.
+                          The --force flag deletes and re-create the resource, when PATCH encounters conflict and has
+                          retried for 5 times.
+                        type: boolean
+                    type: object
+                type: object
+            required:
+            - groups
+            type: object
+            x-kubernetes-validations:
+            - message: spec is immutable, except spec.paused
+              rule: self.groups == oldSelf.groups && has(self.prune) == has(oldSelf.prune)
+                && (!has(self.prune) || self.prune == oldSelf.prune) && has(self.dryRun)
+                == has(oldSelf.dryRun) && (!has(self.dryRun) || self.dryRun == oldSelf.dryRun)
+                && has(self.syncOptions) == has(oldSelf.syncOptions) && (!has(self.syncOptions)
+                || self.syncOptions == oldSelf.syncOptions) && has(self.syncStrategy)
+                == has(oldSelf.syncStrategy) && (!has(self.syncStrategy) || self.syncStrategy
+                == oldSelf.syncStrategy) && has(self.retry) == has(oldSelf.retry)
+                && (!has(self.retry) || self.retry == oldSelf.retry) && has(self.initiatedBy)
+                == has(oldSelf.initiatedBy) && (!has(self.initiatedBy) || self.initiatedBy
+                == oldSelf.initiatedBy) && has(self.info) == has(oldSelf.info) &&
+                (!has(self.info) || self.info == oldSelf.info) && has(self.onFailure)
+                == has(oldSelf.onFailure) && (!has(self.onFailure) || self.onFailure
+                == oldSelf.onFailure) && has(self.doneWhen) == has(oldSelf.doneWhen)
+                && (!has(self.doneWhen) || self.doneWhen == oldSelf.doneWhen) && has(self.skipIfSynced)
+                == has(oldSelf.skipIfSynced) && (!has(self.skipIfSynced) || self.skipIfSynced
+                == oldSelf.skipIfSynced)
+          status:
+            description: ApplicationSyncStatus is the observed progress of an ApplicationSync
+            properties:
+              finishedAt:
+                description: FinishedAt is when every group reached a terminal phase
+                format: date-time
+                type: string
+              groups:
+                description: Groups holds per-group and per-app progress, in spec.groups
+                  order
+                items:
+                  description: ApplicationSyncGroupStatus is the progress of one group
+                    within an ApplicationSync
+                  properties:
+                    apps:
+                      description: Apps holds per-app progress, in the group's apps
+                        order
+                      items:
+                        description: ApplicationSyncAppStatus is the progress of one
+                          Application within an ApplicationSync
+                        properties:
+                          finishedAt:
+                            format: date-time
+                            type: string
+                          message:
+                            type: string
+                          name:
+                            type: string
+                          phase:
+                            description: ApplicationSyncPhase is the phase of an ApplicationSync,
+                              or of one of its groups or Applications
+                            type: string
+                          pinnedRevisions:
+                            description: |-
+                              PinnedRevisions are the spec revisions matched to the app's sources, one per source in spec.sources order,
+                              empty for sources that aren't pinned
+                            items:
+                              type: string
+                            type: array
+                          revisions:
+                            description: Revisions the sync operation resolved to,
+                              one per source
+                            items:
+                              type: string
+                            type: array
+                          startedAt:
+                            description: StartedAt and FinishedAt mirror the Application's
+                              operationState for this sync
+                            format: date-time
+                            type: string
+                        required:
+                        - name
+                        - phase
+                        type: object
+                      type: array
+                    message:
+                      type: string
+                    name:
+                      type: string
+                    phase:
+                      description: ApplicationSyncPhase is the phase of an ApplicationSync,
+                        or of one of its groups or Applications
+                      type: string
+                  required:
+                  - name
+                  - phase
+                  type: object
+                type: array
+              message:
+                type: string
+              phase:
+                description: ApplicationSyncPhase is the phase of an ApplicationSync,
+                  or of one of its groups or Applications
+                type: string
+              startedAt:
+                description: StartedAt is when the controller accepted the ApplicationSync
+                format: date-time
+                type: string
+            type: object
+        required:
+        - metadata
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
