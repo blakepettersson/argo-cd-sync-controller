@@ -44,6 +44,10 @@ func autoSyncEnabled(app *argov1alpha1.Application) bool {
 // errAnotherOperationInProgress mirrors the Sync API's error when an app already has an operation.
 var errAnotherOperationInProgress = errors.New("another operation is already in progress")
 
+// errApplicationSyncGone is returned when the ApplicationSync was deleted, or replaced by a same-named one, since it
+// was read from the cache.
+var errApplicationSyncGone = errors.New("the ApplicationSync no longer exists")
+
 // argoCD reads Argo CD's objects and settings. Settings and live reads go to the API server directly, so the
 // controller doesn't cache every ConfigMap in the cluster.
 type argoCD struct {

@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -59,6 +60,16 @@ func testApp(name string) *argov1alpha1.Application {
 	reconciled := metav1.NewTime(time.Now().Add(time.Hour))
 	app.Status.ReconciledAt = &reconciled
 	return app
+}
+
+// reconcileSync runs one pass for s, creating it in the fake client first if needed, since the controller reads the
+// ApplicationSync live before it starts a sync.
+func reconcileSync(t *testing.T, r *ApplicationSyncReconciler, s *syncv1alpha1.ApplicationSync) {
+	t.Helper()
+	if err := r.Create(t.Context(), s.DeepCopy()); err != nil && !apierrors.IsAlreadyExists(err) {
+		require.NoError(t, err)
+	}
+	r.reconcileApplicationSync(t.Context(), s)
 }
 
 func newTestReconciler(t *testing.T, objs ...client.Object) *ApplicationSyncReconciler {
@@ -153,7 +164,7 @@ func TestOnlyPolicyRunsAreAutomatic(t *testing.T) {
 	assert.True(t, isAutomated(s))
 
 	r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, testApp("db"))...)
-	r.reconcileApplicationSync(t.Context(), s)
+	reconcileSync(t, r, s)
 	assert.True(t, getTestApp(t, r.Client, "db").Operation.InitiatedBy.Automated, "the operation is marked automatic")
 }
 
@@ -218,7 +229,7 @@ func TestDependencyOrder(t *testing.T) {
 	r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, testApp("db"), testApp("api"))...)
 	s := newSync(group("data", nil, "db"), group("backend", []string{"data"}, "api"))
 
-	r.reconcileApplicationSync(t.Context(), s)
+	reconcileSync(t, r, s)
 	assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseRunning, s.Status.Phase)
 	assert.Equal(t, map[string]syncv1alpha1.ApplicationSyncPhase{"data": "Running", "backend": "Pending"}, groupPhases(s))
 	assert.Equal(t, `waiting for group "data"`, s.Status.Groups[1].Message)
@@ -228,7 +239,7 @@ func TestDependencyOrder(t *testing.T) {
 	assert.True(t, isOperationFor(s, db.Operation))
 
 	finishOperation(t, r.Client, "db", synccommon.OperationSucceeded, health.HealthStatusProgressing)
-	r.reconcileApplicationSync(t.Context(), s)
+	reconcileSync(t, r, s)
 	assert.Equal(t, map[string]syncv1alpha1.ApplicationSyncPhase{"db": "Progressing", "api": "Pending"}, appPhases(s))
 
 	updateTestApp(t, r.Client, "db", func(app *argov1alpha1.Application) {
@@ -236,11 +247,11 @@ func TestDependencyOrder(t *testing.T) {
 		now := metav1.Now()
 		app.Status.ReconciledAt = &now
 	})
-	r.reconcileApplicationSync(t.Context(), s)
+	reconcileSync(t, r, s)
 	assert.Equal(t, map[string]syncv1alpha1.ApplicationSyncPhase{"data": "Succeeded", "backend": "Running"}, groupPhases(s))
 
 	finishOperation(t, r.Client, "api", synccommon.OperationSucceeded, health.HealthStatusHealthy)
-	r.reconcileApplicationSync(t.Context(), s)
+	reconcileSync(t, r, s)
 	assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseSucceeded, s.Status.Phase)
 	assert.NotNil(t, s.Status.FinishedAt)
 }
@@ -249,14 +260,14 @@ func TestFailureSkipsDependents(t *testing.T) {
 	r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, testApp("db"), testApp("api"), testApp("web"), testApp("cache"))...)
 	s := newSync(group("data", nil, "db"), group("backend", []string{"data"}, "api"), group("frontend", []string{"backend"}, "web"), group("caches", nil, "cache"))
 
-	r.reconcileApplicationSync(t.Context(), s)
+	reconcileSync(t, r, s)
 	finishOperation(t, r.Client, "db", synccommon.OperationFailed, health.HealthStatusHealthy)
-	r.reconcileApplicationSync(t.Context(), s)
+	reconcileSync(t, r, s)
 	assert.Equal(t, map[string]syncv1alpha1.ApplicationSyncPhase{"data": "Failed", "backend": "Skipped", "frontend": "Skipped", "caches": "Running"}, groupPhases(s))
 	assert.Equal(t, `group "backend" skipped`, appStatus(t, s, "web").Message)
 
 	finishOperation(t, r.Client, "cache", synccommon.OperationSucceeded, health.HealthStatusHealthy)
-	r.reconcileApplicationSync(t.Context(), s)
+	reconcileSync(t, r, s)
 	assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseFailed, s.Status.Phase)
 	assert.Equal(t, "3 of 4 applications did not succeed", s.Status.Message)
 }
@@ -265,15 +276,15 @@ func TestGroupAppsRunInParallel(t *testing.T) {
 	r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, testApp("api"), testApp("worker"), testApp("web"))...)
 	s := newSync(group("backend", nil, "api", "worker"), group("frontend", []string{"backend"}, "web"))
 
-	r.reconcileApplicationSync(t.Context(), s)
+	reconcileSync(t, r, s)
 	assert.Equal(t, map[string]syncv1alpha1.ApplicationSyncPhase{"api": "Running", "worker": "Running", "web": "Pending"}, appPhases(s))
 
 	finishOperation(t, r.Client, "api", synccommon.OperationFailed, health.HealthStatusHealthy)
-	r.reconcileApplicationSync(t.Context(), s)
+	reconcileSync(t, r, s)
 	assert.Equal(t, map[string]syncv1alpha1.ApplicationSyncPhase{"backend": "Running", "frontend": "Pending"}, groupPhases(s), "the group waits for worker")
 
 	finishOperation(t, r.Client, "worker", synccommon.OperationSucceeded, health.HealthStatusHealthy)
-	r.reconcileApplicationSync(t.Context(), s)
+	reconcileSync(t, r, s)
 	assert.Equal(t, map[string]syncv1alpha1.ApplicationSyncPhase{"backend": "Failed", "frontend": "Skipped"}, groupPhases(s))
 }
 
@@ -281,11 +292,11 @@ func TestEmptyGroupsAndInvalidSpec(t *testing.T) {
 	r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, testApp("db"))...)
 
 	s := newSync(group("empty", nil), group("data", []string{"empty"}, "db"))
-	r.reconcileApplicationSync(t.Context(), s)
+	reconcileSync(t, r, s)
 	assert.Equal(t, map[string]syncv1alpha1.ApplicationSyncPhase{"empty": "Succeeded", "data": "Running"}, groupPhases(s))
 
 	s = newSync(group("a", []string{"missing"}, "db"))
-	r.reconcileApplicationSync(t.Context(), s)
+	reconcileSync(t, r, s)
 	assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseFailed, s.Status.Phase)
 	assert.Contains(t, s.Status.Message, `group "a" depends on "missing"`)
 }
@@ -296,20 +307,20 @@ func TestWaits(t *testing.T) {
 		app.Operation = &argov1alpha1.Operation{Sync: &argov1alpha1.SyncOperation{}}
 		r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, app)...)
 		s := newSync(group("data", nil, "db"))
-		r.reconcileApplicationSync(t.Context(), s)
+		reconcileSync(t, r, s)
 		assert.Equal(t, "waiting for another operation to finish", appStatus(t, s, "db").Message)
 	})
 	t.Run("missing app", func(t *testing.T) {
 		r := newTestReconciler(t, testProject(nil))
 		s := newSync(group("data", nil, "db"))
-		r.reconcileApplicationSync(t.Context(), s)
+		reconcileSync(t, r, s)
 		assert.Equal(t, "waiting for application to exist", appStatus(t, s, "db").Message)
 	})
 	t.Run("closed sync window", func(t *testing.T) {
 		windows := argov1alpha1.SyncWindows{{Kind: "deny", Schedule: "* * * * *", Duration: "1h", Applications: []string{"*"}}}
 		r := newTestReconciler(t, withApps([]client.Object{testProject(windows)}, testApp("db"))...)
 		s := newSync(group("data", nil, "db"))
-		r.reconcileApplicationSync(t.Context(), s)
+		reconcileSync(t, r, s)
 		st := appStatus(t, s, "db")
 		assert.Equal(t, syncv1alpha1.ApplicationSyncPhasePending, st.Phase)
 		assert.Equal(t, "waiting for a sync window to allow the sync", st.Message)
@@ -322,9 +333,9 @@ func TestOnFailureWait(t *testing.T) {
 	s := newSync(group("data", nil, "db"), group("backend", []string{"data"}, "api"))
 	s.Spec.OnFailure = syncv1alpha1.ApplicationSyncOnFailureWait
 
-	r.reconcileApplicationSync(t.Context(), s)
+	reconcileSync(t, r, s)
 	finishOperation(t, r.Client, "db", synccommon.OperationFailed, health.HealthStatusDegraded)
-	r.reconcileApplicationSync(t.Context(), s)
+	reconcileSync(t, r, s)
 	assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseProgressing, appStatus(t, s, "db").Phase)
 	assert.Equal(t, map[string]syncv1alpha1.ApplicationSyncPhase{"data": "Running", "backend": "Pending"}, groupPhases(s))
 
@@ -334,7 +345,7 @@ func TestOnFailureWait(t *testing.T) {
 		reconciled := metav1.NewTime(time.Now().Add(time.Hour))
 		app.Status.ReconciledAt = &reconciled
 	})
-	r.reconcileApplicationSync(t.Context(), s)
+	reconcileSync(t, r, s)
 	assert.Equal(t, map[string]syncv1alpha1.ApplicationSyncPhase{"data": "Succeeded", "backend": "Running"}, groupPhases(s))
 }
 
@@ -353,13 +364,13 @@ func TestDoneWhen(t *testing.T) {
 			r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, testApp("db"))...)
 			s := newSync(group("data", nil, "db"))
 			s.Spec.DoneWhen = tc.doneWhen
-			r.reconcileApplicationSync(t.Context(), s)
+			reconcileSync(t, r, s)
 			finishOperation(t, r.Client, "db", synccommon.OperationSucceeded, health.HealthStatusHealthy)
 			updateTestApp(t, r.Client, "db", func(app *argov1alpha1.Application) {
 				app.Status.Sync.Status = argov1alpha1.SyncStatusCodeOutOfSync
 				app.Status.Sync.Revision = tc.syncedRevision
 			})
-			r.reconcileApplicationSync(t.Context(), s)
+			reconcileSync(t, r, s)
 			assert.Equal(t, tc.want, appStatus(t, s, "db").Phase)
 			if tc.want == syncv1alpha1.ApplicationSyncPhaseSucceeded {
 				assert.Equal(t, argov1alpha1.SyncStatusCodeOutOfSync, appStatus(t, s, "db").SyncStatus, "the sync status it ended with is recorded")
@@ -371,12 +382,12 @@ func TestDoneWhen(t *testing.T) {
 func TestStaleStatusRequestsRefresh(t *testing.T) {
 	r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, testApp("db"))...)
 	s := newSync(group("data", nil, "db"))
-	r.reconcileApplicationSync(t.Context(), s)
+	reconcileSync(t, r, s)
 	finishOperation(t, r.Client, "db", synccommon.OperationSucceeded, health.HealthStatusHealthy)
 	// The spec changed after the last comparison, as with a Helm parameter change.
 	updateTestApp(t, r.Client, "db", func(app *argov1alpha1.Application) { app.Spec.Source.Path = "other/path" })
 
-	r.reconcileApplicationSync(t.Context(), s)
+	reconcileSync(t, r, s)
 	assert.Equal(t, "waiting for application to be refreshed", appStatus(t, s, "db").Message)
 	assert.Equal(t, "normal", getTestApp(t, r.Client, "db").Annotations[refreshAnnotation], "a refresh is requested the way the CLI does")
 }
@@ -390,7 +401,7 @@ func TestSkipIfSynced(t *testing.T) {
 	s := newSync(group("data", nil, "db"))
 	s.Spec.SkipIfSynced = true
 
-	r.reconcileApplicationSync(t.Context(), s)
+	reconcileSync(t, r, s)
 	assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseSucceeded, s.Status.Phase)
 	assert.Nil(t, getTestApp(t, r.Client, "db").Operation)
 }
@@ -410,7 +421,7 @@ func TestMaxParallelAndPause(t *testing.T) {
 			g := group("all", nil, "a", "b")
 			g.MaxParallel = &tc.maxParallel
 			s := newSync(g)
-			r.reconcileApplicationSync(t.Context(), s)
+			reconcileSync(t, r, s)
 			running := 0
 			for _, st := range s.Status.Groups[0].Apps {
 				if st.Phase == syncv1alpha1.ApplicationSyncPhaseRunning {
@@ -426,12 +437,12 @@ func TestMaxParallelAndPause(t *testing.T) {
 		r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, testApp("db"))...)
 		s := newSync(group("data", nil, "db"))
 		s.Spec.Paused = true
-		r.reconcileApplicationSync(t.Context(), s)
+		reconcileSync(t, r, s)
 		assert.Equal(t, "paused", s.Status.Message)
 		assert.Nil(t, getTestApp(t, r.Client, "db").Operation)
 
 		s.Spec.Paused = false
-		r.reconcileApplicationSync(t.Context(), s)
+		reconcileSync(t, r, s)
 		assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseRunning, appStatus(t, s, "db").Phase)
 	})
 }
@@ -446,7 +457,7 @@ func TestOperationFields(t *testing.T) {
 	s.Spec.InitiatedBy = syncv1alpha1.ApplicationSyncInitiator{Username: "ci"}
 	s.Spec.Info = []*argov1alpha1.Info{{Name: "Reason", Value: "release"}}
 
-	r.reconcileApplicationSync(t.Context(), s)
+	reconcileSync(t, r, s)
 	op := getTestApp(t, r.Client, "db").Operation
 	require.NotNil(t, op)
 	assert.False(t, op.Sync.Prune, "the per-app prune overrides spec.prune")
@@ -475,7 +486,7 @@ func TestRevisions(t *testing.T) {
 		g := group("data", nil, "db")
 		g.Apps[0].Revisions = revisions
 		s := newSync(g)
-		r.reconcileApplicationSync(t.Context(), s)
+		reconcileSync(t, r, s)
 		return r, s
 	}
 
@@ -569,7 +580,7 @@ func TestOperationFromRecreatedApplicationSyncIsNotAdopted(t *testing.T) {
 	r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, testApp("db"))...)
 	old := newSync(group("data", nil, "db"))
 	old.UID = "old-uid"
-	r.reconcileApplicationSync(t.Context(), old)
+	reconcileSync(t, r, old)
 	require.True(t, isOperationFor(old, getTestApp(t, r.Client, "db").Operation))
 	// The application controller starts the old run's operation only after the same-named run was recreated.
 	finishOperation(t, r.Client, "db", synccommon.OperationSucceeded, health.HealthStatusHealthy)
@@ -578,6 +589,17 @@ func TestOperationFromRecreatedApplicationSyncIsNotAdopted(t *testing.T) {
 	db := getTestApp(t, r.Client, "db")
 	assert.False(t, isOperationFor(recreated, &db.Status.OperationState.Operation))
 	assert.Nil(t, operationStateFor(recreated, db), "the result belongs to the deleted run")
+}
+
+func TestDeletedApplicationSyncStartsNoSync(t *testing.T) {
+	r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, testApp("db"))...)
+	s := newSync(group("data", nil, "db"))
+	require.NoError(t, r.Create(t.Context(), s.DeepCopy()))
+	require.NoError(t, r.Delete(t.Context(), s.DeepCopy()))
+
+	// s is the copy a stale cache would still hand to a reconcile.
+	r.reconcileApplicationSync(t.Context(), s)
+	assert.Nil(t, getTestApp(t, r.Client, "db").Operation)
 }
 
 func TestReconcileRecordsObservedGeneration(t *testing.T) {
@@ -636,7 +658,7 @@ func TestAllowEmpty(t *testing.T) {
 			}
 			s.Spec.AllowEmpty = tc.allowEmpty
 
-			r.reconcileApplicationSync(t.Context(), s)
+			reconcileSync(t, r, s)
 			st := appStatus(t, s, "db")
 			assert.Equal(t, tc.want, st.Phase, st.Message)
 			if tc.want == syncv1alpha1.ApplicationSyncPhaseFailed {
@@ -653,7 +675,7 @@ func TestRefusesAutoSyncedApp(t *testing.T) {
 	r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, app)...)
 
 	s := newSync(group("data", nil, "db"))
-	r.reconcileApplicationSync(t.Context(), s)
+	reconcileSync(t, r, s)
 	st := appStatus(t, s, "db")
 	assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseFailed, st.Phase)
 	assert.Contains(t, st.Message, "auto-sync is enabled")
@@ -662,9 +684,9 @@ func TestRefusesAutoSyncedApp(t *testing.T) {
 	// With onFailure: Wait, the app waits until auto-sync is turned off, here with automated.enabled: false.
 	s = newSync(group("data", nil, "db"))
 	s.Spec.OnFailure = syncv1alpha1.ApplicationSyncOnFailureWait
-	r.reconcileApplicationSync(t.Context(), s)
+	reconcileSync(t, r, s)
 	assert.Equal(t, syncv1alpha1.ApplicationSyncPhasePending, appStatus(t, s, "db").Phase)
 	updateTestApp(t, r.Client, "db", func(app *argov1alpha1.Application) { app.Spec.SyncPolicy.Automated.Enabled = new(false) })
-	r.reconcileApplicationSync(t.Context(), s)
+	reconcileSync(t, r, s)
 	assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseRunning, appStatus(t, s, "db").Phase)
 }

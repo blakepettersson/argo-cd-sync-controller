@@ -352,6 +352,9 @@ func (r *ApplicationSyncReconciler) reconcileApp(ctx context.Context, s *syncv1a
 			}
 		}
 		err = r.startOperation(ctx, s, spec, st, app)
+		if errors.Is(err, errApplicationSyncGone) {
+			return
+		}
 		if errors.Is(err, errAnotherOperationInProgress) {
 			st.Message = "waiting for another operation to finish"
 			return
@@ -590,6 +593,18 @@ func (r *ApplicationSyncReconciler) startOperation(ctx context.Context, s *syncv
 	}
 	if retry != nil {
 		op.Retry = *retry
+	}
+	// The cache can still hold an ApplicationSync that was deleted, for example by argocd-server after a handoff
+	// timeout; never start a sync for it.
+	var live syncv1alpha1.ApplicationSync
+	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(s), &live); err != nil {
+		if apierrors.IsNotFound(err) {
+			return errApplicationSyncGone
+		}
+		return err
+	}
+	if live.UID != s.UID || live.DeletionTimestamp != nil {
+		return errApplicationSyncGone
 	}
 	if err := argo.setOperation(ctx, app.Namespace, app.Name, &op); err != nil {
 		return err
