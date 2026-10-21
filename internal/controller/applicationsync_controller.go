@@ -48,8 +48,9 @@ type ApplicationSyncReconciler struct {
 // +kubebuilder:rbac:groups=argoproj.io,resources=applicationsyncs,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups=argoproj.io,resources=applicationsyncs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=argoproj.io,resources=applications,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups=argoproj.io,resources=appprojects,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get
+// AppProjects and Argo CD's ConfigMaps live in Argo CD's namespace, so they get a namespaced Role there.
+// +kubebuilder:rbac:groups=argoproj.io,namespace=argocd,resources=appprojects,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",namespace=argocd,resources=configmaps,verbs=get
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 func (r *ApplicationSyncReconciler) argoCD() *argoCD {

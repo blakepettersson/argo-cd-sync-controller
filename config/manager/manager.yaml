@@ -23,13 +23,7 @@ spec:
       - name: manager
         image: controller
         args:
-        - --argocd-namespace=$(ARGOCD_NAMESPACE)
         - --leader-elect
-        env:
-        - name: ARGOCD_NAMESPACE
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.namespace
         ports:
         - name: metrics
           containerPort: 8080
