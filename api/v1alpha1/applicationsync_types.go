@@ -3,6 +3,7 @@ package v1alpha1
 import (
 	argov1alpha1 "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
@@ -253,9 +254,15 @@ const (
 
 // ApplicationSyncPolicyStatus is the observed state of an ApplicationSyncPolicy
 type ApplicationSyncPolicyStatus struct {
-	// CurrentRun is the name of the ApplicationSync the policy created last
+	// CurrentRun is the name of the ApplicationSync the policy created last. It is recorded before the run is
+	// created, so a run is never left unrecorded.
 	CurrentRun string `json:"currentRun,omitempty"`
-	Message    string `json:"message,omitempty"`
+	// CurrentRunUID is CurrentRun's UID, recorded once it is created. Only the controller writes status, so this,
+	// not a run's labels or owner references, is what identifies the policy's run.
+	CurrentRunUID types.UID `json:"currentRunUID,omitempty"`
+	// CurrentRunChange is the change CurrentRun rolls out, so the policy starts no second run for it.
+	CurrentRunChange string `json:"currentRunChange,omitempty"`
+	Message          string `json:"message,omitempty"`
 	// SelfHealAttempts counts the self-heal runs started for the current change
 	SelfHealAttempts int64 `json:"selfHealAttempts,omitempty"`
 	// ObservedGeneration is the metadata.generation this status was computed for

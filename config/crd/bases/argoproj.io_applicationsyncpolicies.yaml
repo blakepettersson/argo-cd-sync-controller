@@ -345,8 +345,18 @@ spec:
             description: ApplicationSyncPolicyStatus is the observed state of an ApplicationSyncPolicy
             properties:
               currentRun:
-                description: CurrentRun is the name of the ApplicationSync the policy
-                  created last
+                description: |-
+                  CurrentRun is the name of the ApplicationSync the policy created last. It is recorded before the run is
+                  created, so a run is never left unrecorded.
+                type: string
+              currentRunChange:
+                description: CurrentRunChange is the change CurrentRun rolls out,
+                  so the policy starts no second run for it.
+                type: string
+              currentRunUID:
+                description: |-
+                  CurrentRunUID is CurrentRun's UID, recorded once it is created. Only the controller writes status, so this,
+                  not a run's labels or owner references, is what identifies the policy's run.
                 type: string
               message:
                 type: string

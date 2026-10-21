@@ -8,8 +8,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	syncv1alpha1 "github.com/argoproj-labs/argo-cd-sync-controller/api/v1alpha1"
@@ -274,14 +277,60 @@ func TestPolicyIgnoresStaleCurrentRun(t *testing.T) {
 	_, err := r.reconcilePolicy(t.Context(), p)
 	require.NoError(t, err)
 	require.Len(t, listRuns(t, r), 1)
-	assert.Equal(t, "1", listRuns(t, r)[0].Annotations[policyRunAnnotation])
+	assert.Equal(t, "platform-1", listRuns(t, r)[0].Name)
 
 	_, err = r.reconcilePolicy(t.Context(), stale)
-	require.NoError(t, err)
-	runs := listRuns(t, r)
-	require.Len(t, runs, 1)
-	assert.Contains(t, stale.Status.Message, "is in progress")
-	assert.Equal(t, runs[0].Name, stale.Status.CurrentRun, "a lost status update is repaired")
+	require.True(t, apierrors.IsConflict(err), "recording the next run fails on the stale resourceVersion: %v", err)
+	require.Len(t, listRuns(t, r), 1)
+}
+
+// TestPolicyAdoptsRunWhoseUIDWasNotRecorded covers the controller stopping between creating a run and recording its
+// UID.
+func TestPolicyAdoptsRunWhoseUIDWasNotRecorded(t *testing.T) {
+	db := testApp("db")
+	db.Status.Sync.Revision = "aaa111"
+	p := newTestPolicy("")
+	r := newTestPolicyReconciler(t, p, db, testApp("api"))
+	got := reconcilePolicy(t, r, p)
+	run := getRun(t, r, got.Status.CurrentRun)
+
+	got.Status.CurrentRunUID = ""
+	require.NoError(t, r.Status().Update(t.Context(), got))
+	got = reconcilePolicy(t, r, got)
+	require.Len(t, listRuns(t, r), 1)
+	assert.Equal(t, run.UID, got.Status.CurrentRunUID)
+	assert.Contains(t, got.Status.Message, "is in progress")
+}
+
+// TestPolicyIgnoresForgedRuns covers an ApplicationSync made to look like the policy's run: its label, owner
+// reference and name can all be copied, but it isn't recorded in the policy's status.
+func TestPolicyIgnoresForgedRuns(t *testing.T) {
+	db := testApp("db")
+	db.Status.Sync.Revision = "aaa111"
+	p := newTestPolicy(syncv1alpha1.ApplicationSyncConcurrencyForbid)
+	r := newTestPolicyReconciler(t, p, db, testApp("api"))
+	forge := func(name string) {
+		run := newSync(group("data", nil, "db"))
+		run.Name, run.UID = name, types.UID(name+"-uid")
+		run.Labels = map[string]string{PolicyLabel: p.Name}
+		run.Spec.Paused = true
+		require.NoError(t, controllerutil.SetControllerReference(p, run, r.Scheme()))
+		require.NoError(t, r.Create(t.Context(), run))
+	}
+	forge("platform-99")
+	forge("platform-1") // the name the policy would pick first
+
+	got := reconcilePolicy(t, r, p)
+	assert.Equal(t, "platform-2", got.Status.CurrentRun, "a taken name is skipped, not adopted")
+	assert.Contains(t, got.Status.Message, "started run platform-2")
+
+	// The paused forgeries don't hold up a Forbid policy: once its own run is done, the next change starts.
+	run := getRun(t, r, "platform-2")
+	run.Status.Phase = syncv1alpha1.ApplicationSyncPhaseSucceeded
+	require.NoError(t, r.Status().Update(t.Context(), &run))
+	updateTestApp(t, r.Client, "db", func(app *argov1alpha1.Application) { app.Status.Sync.Revision = "bbb222" })
+	got = reconcilePolicy(t, r, got)
+	assert.Equal(t, "platform-3", got.Status.CurrentRun)
 }
 
 // TestPolicySelfHealSkipsAppsLeftOutOfSync covers doneWhen: Healthy, where a run can succeed with an app still

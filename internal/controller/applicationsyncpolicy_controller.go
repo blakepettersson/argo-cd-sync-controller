@@ -7,12 +7,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	argov1alpha1 "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -29,13 +29,8 @@ const (
 	policyAppIndex = "spec.template.groups.apps.name"
 	// PolicyLabel names the policy that created an ApplicationSync.
 	PolicyLabel = "argocd.argoproj.io/application-sync-policy"
-	// policyChangeAnnotation records, on each run, the change it was created for, so a policy doesn't start a
-	// second run for the same revisions and sources (as auto-sync avoids re-syncing a revision it already
-	// attempted).
-	policyChangeAnnotation = "argocd.argoproj.io/application-sync-policy-change"
-	// policyRunAnnotation numbers a policy's runs from 1, so the latest one is known without relying on
-	// creationTimestamp, which only has one-second resolution.
-	policyRunAnnotation = "argocd.argoproj.io/application-sync-policy-run"
+	// maxRunNameAttempts bounds how many taken run names a policy skips before giving up for this pass.
+	maxRunNameAttempts = 10
 )
 
 // ApplicationSyncPolicyReconciler creates an ApplicationSync from a policy's template when one of its apps is
@@ -114,21 +109,25 @@ func (r *ApplicationSyncPolicyReconciler) reconcilePolicy(ctx context.Context, p
 		return 0, nil
 	}
 
-	// Found live rather than through status.currentRun: the cached policy can lag behind the status update that
-	// recorded a run just created, or that update can fail, and either way a second run would start.
-	var runs syncv1alpha1.ApplicationSyncList
-	if err := r.APIReader.List(ctx, &runs, client.InNamespace(p.Namespace), client.MatchingLabels{PolicyLabel: p.Name}); err != nil {
-		return 0, err
-	}
+	// Labels, owner references and annotations can be set by anyone who can create ApplicationSyncs, so the
+	// policy's run is the one its own status records. A stale cached policy can't start a duplicate run: recording
+	// the next run's name below fails on its outdated resourceVersion.
 	var current *syncv1alpha1.ApplicationSync
-	for i := range runs.Items {
-		run := &runs.Items[i]
-		if metav1.IsControlledBy(run, p) && (current == nil || runNumber(current) < runNumber(run)) {
-			current = run
+	if p.Status.CurrentRun != "" {
+		var run syncv1alpha1.ApplicationSync
+		err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: p.Namespace, Name: p.Status.CurrentRun}, &run)
+		switch {
+		case apierrors.IsNotFound(err):
+		case err != nil:
+			return 0, err
+		case p.Status.CurrentRunUID == "":
+			// Created, but the UID wasn't recorded before the controller stopped. The name was recorded first, and
+			// a create by anyone else under that name would have failed ours, so this run is the policy's.
+			p.Status.CurrentRunUID = run.UID
+			current = &run
+		case run.UID == p.Status.CurrentRunUID:
+			current = &run
 		}
-	}
-	if current != nil {
-		p.Status.CurrentRun = current.Name
 	}
 
 	argo := r.argoCD()
@@ -163,7 +162,7 @@ func (r *ApplicationSyncPolicyReconciler) reconcilePolicy(ctx context.Context, p
 
 	change := policyChange(names, apps)
 	selfHeal := false
-	if current != nil && current.Annotations[policyChangeAnnotation] == change {
+	if current != nil && p.Status.CurrentRunChange == change {
 		// Same revisions and sources as the last run: like auto-sync, don't retry what was already attempted,
 		// and only self-heal drift after a run that succeeded.
 		if !current.Status.Phase.Completed() {
@@ -201,27 +200,16 @@ func (r *ApplicationSyncPolicyReconciler) reconcilePolicy(ctx context.Context, p
 		}
 	}
 
-	run := &syncv1alpha1.ApplicationSync{}
-	run.GenerateName = p.Name + "-"
-	run.Namespace = p.Namespace
-	run.Labels = map[string]string{PolicyLabel: p.Name}
-	next := 1
-	if current != nil {
-		next = runNumber(current) + 1
-	}
-	run.Annotations = map[string]string{policyChangeAnnotation: change, policyRunAnnotation: strconv.Itoa(next)}
-	run.Spec = *p.Spec.Template.DeepCopy()
-	pinFromStatus(&run.Spec, apps)
-	if selfHeal {
-		limitToDrift(&run.Spec, apps)
-	}
-	if err := controllerutil.SetControllerReference(p, run, r.Scheme()); err != nil {
+	run, err := r.createRun(ctx, p, change, func(run *syncv1alpha1.ApplicationSync) {
+		run.Spec = *p.Spec.Template.DeepCopy()
+		pinFromStatus(&run.Spec, apps)
+		if selfHeal {
+			limitToDrift(&run.Spec, apps)
+		}
+	})
+	if err != nil {
 		return 0, err
 	}
-	if err := r.Create(ctx, run); err != nil {
-		return 0, fmt.Errorf("creating run: %w", err)
-	}
-	p.Status.CurrentRun = run.Name
 	p.Status.Message = "started run " + run.Name
 	// A new change resets the count, as a new revision does for auto-sync.
 	if selfHeal {
@@ -244,9 +232,37 @@ func leftOutOfSync(run *syncv1alpha1.ApplicationSync, apps map[string]*argov1alp
 	return ""
 }
 
-func runNumber(run *syncv1alpha1.ApplicationSync) int {
-	n, _ := strconv.Atoi(run.Annotations[policyRunAnnotation])
-	return n
+// createRun records the next run's name in the policy's status, then creates it and records its UID. If another
+// object already has that name, it moves on to the next one.
+func (r *ApplicationSyncPolicyReconciler) createRun(ctx context.Context, p *syncv1alpha1.ApplicationSyncPolicy, change string, fill func(*syncv1alpha1.ApplicationSync)) (*syncv1alpha1.ApplicationSync, error) {
+	next, _ := strconv.Atoi(strings.TrimPrefix(p.Status.CurrentRun, p.Name+"-"))
+	for range maxRunNameAttempts {
+		next++
+		p.Status.CurrentRun = fmt.Sprintf("%s-%d", p.Name, next)
+		p.Status.CurrentRunUID = ""
+		p.Status.CurrentRunChange = change
+		if err := r.Status().Update(ctx, p); err != nil {
+			return nil, fmt.Errorf("recording run %s: %w", p.Status.CurrentRun, err)
+		}
+		run := &syncv1alpha1.ApplicationSync{}
+		run.Name = p.Status.CurrentRun
+		run.Namespace = p.Namespace
+		run.Labels = map[string]string{PolicyLabel: p.Name}
+		fill(run)
+		if err := controllerutil.SetControllerReference(p, run, r.Scheme()); err != nil {
+			return nil, err
+		}
+		err := r.Create(ctx, run)
+		if apierrors.IsAlreadyExists(err) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("creating run: %w", err)
+		}
+		p.Status.CurrentRunUID = run.UID
+		return run, nil
+	}
+	return nil, fmt.Errorf("no free run name after %s", p.Status.CurrentRun)
 }
 
 // limitToDrift makes a self-heal run sync only what drifted, as automated.selfHeal does: Synced apps are
