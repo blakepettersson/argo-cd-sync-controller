@@ -25,7 +25,7 @@ type ApplicationSync struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata"`
 	// Every field except paused is immutable. CEL can't compare a struct minus one field, so each is listed.
-	// +kubebuilder:validation:XValidation:rule="self.groups == oldSelf.groups && has(self.prune) == has(oldSelf.prune) && (!has(self.prune) || self.prune == oldSelf.prune) && has(self.dryRun) == has(oldSelf.dryRun) && (!has(self.dryRun) || self.dryRun == oldSelf.dryRun) && has(self.syncOptions) == has(oldSelf.syncOptions) && (!has(self.syncOptions) || self.syncOptions == oldSelf.syncOptions) && has(self.syncStrategy) == has(oldSelf.syncStrategy) && (!has(self.syncStrategy) || self.syncStrategy == oldSelf.syncStrategy) && has(self.retry) == has(oldSelf.retry) && (!has(self.retry) || self.retry == oldSelf.retry) && has(self.initiatedBy) == has(oldSelf.initiatedBy) && (!has(self.initiatedBy) || self.initiatedBy == oldSelf.initiatedBy) && has(self.info) == has(oldSelf.info) && (!has(self.info) || self.info == oldSelf.info) && has(self.onFailure) == has(oldSelf.onFailure) && (!has(self.onFailure) || self.onFailure == oldSelf.onFailure) && has(self.doneWhen) == has(oldSelf.doneWhen) && (!has(self.doneWhen) || self.doneWhen == oldSelf.doneWhen) && has(self.skipIfSynced) == has(oldSelf.skipIfSynced) && (!has(self.skipIfSynced) || self.skipIfSynced == oldSelf.skipIfSynced)",message="spec is immutable, except spec.paused"
+	// +kubebuilder:validation:XValidation:rule="self.groups == oldSelf.groups && has(self.prune) == has(oldSelf.prune) && (!has(self.prune) || self.prune == oldSelf.prune) && has(self.dryRun) == has(oldSelf.dryRun) && (!has(self.dryRun) || self.dryRun == oldSelf.dryRun) && has(self.syncOptions) == has(oldSelf.syncOptions) && (!has(self.syncOptions) || self.syncOptions == oldSelf.syncOptions) && has(self.syncStrategy) == has(oldSelf.syncStrategy) && (!has(self.syncStrategy) || self.syncStrategy == oldSelf.syncStrategy) && has(self.retry) == has(oldSelf.retry) && (!has(self.retry) || self.retry == oldSelf.retry) && has(self.initiatedBy) == has(oldSelf.initiatedBy) && (!has(self.initiatedBy) || self.initiatedBy == oldSelf.initiatedBy) && has(self.info) == has(oldSelf.info) && (!has(self.info) || self.info == oldSelf.info) && has(self.onFailure) == has(oldSelf.onFailure) && (!has(self.onFailure) || self.onFailure == oldSelf.onFailure) && has(self.doneWhen) == has(oldSelf.doneWhen) && (!has(self.doneWhen) || self.doneWhen == oldSelf.doneWhen) && has(self.skipIfSynced) == has(oldSelf.skipIfSynced) && (!has(self.skipIfSynced) || self.skipIfSynced == oldSelf.skipIfSynced) && has(self.allowEmpty) == has(oldSelf.allowEmpty) && (!has(self.allowEmpty) || self.allowEmpty == oldSelf.allowEmpty)",message="spec is immutable, except spec.paused"
 	Spec   ApplicationSyncSpec   `json:"spec"`
 	Status ApplicationSyncStatus `json:"status,omitempty"`
 }
@@ -49,8 +49,7 @@ type ApplicationSyncSpec struct {
 	// Retry overrides each Application's spec.syncPolicy.retry when set
 	Retry *argov1alpha1.RetryStrategy `json:"retry,omitempty"`
 	// InitiatedBy is copied into each app's operation. It is informational only and never used for authorization.
-	// When Automated is true, sync windows are checked with automatic semantics.
-	InitiatedBy argov1alpha1.OperationInitiator `json:"initiatedBy,omitempty"`
+	InitiatedBy ApplicationSyncInitiator `json:"initiatedBy,omitempty"`
 	// Info is added to each app's operation
 	Info []*argov1alpha1.Info `json:"info,omitempty"`
 	// OnFailure decides what happens when an app fails: Fail (default) fails it and skips its dependents, Wait keeps
@@ -65,6 +64,9 @@ type ApplicationSyncSpec struct {
 	// Paused stops new app syncs from starting; syncs already running finish. It is the only field that can
 	// change after creation.
 	Paused bool `json:"paused,omitempty"`
+	// AllowEmpty lets an automated run with prune sync an app whose resources would all be pruned, as
+	// automated.allowEmpty does for auto-sync. An app with no resources at all is never blocked.
+	AllowEmpty bool `json:"allowEmpty,omitempty"`
 }
 
 // ApplicationSyncOnFailure is what an ApplicationSync does when an app fails
@@ -132,9 +134,20 @@ type ApplicationSyncRevision struct {
 	Revision string `json:"revision"`
 }
 
+// ApplicationSyncInitiator records who asked for an ApplicationSync. Whether a run is automatic isn't set here: only
+// runs owned by an ApplicationSyncPolicy are.
+type ApplicationSyncInitiator struct {
+	// Username of whoever created the ApplicationSync
+	Username string `json:"username,omitempty"`
+}
+
 // ApplicationSyncOperationInfoName tags each Operation an ApplicationSync starts with an Info entry whose value
-// is the ApplicationSync's name, so the result can be matched back from status.operationState.
+// is the ApplicationSync's name, so history shows which run started it.
 const ApplicationSyncOperationInfoName = "ApplicationSync"
+
+// ApplicationSyncOperationUIDInfoName tags each Operation with the ApplicationSync's UID, which is what the result
+// is matched back on, so a same-named ApplicationSync that was deleted and recreated never adopts it.
+const ApplicationSyncOperationUIDInfoName = "ApplicationSyncUID"
 
 // ApplicationSyncPhase is the phase of an ApplicationSync, or of one of its groups or Applications
 type ApplicationSyncPhase string
@@ -165,6 +178,8 @@ type ApplicationSyncStatus struct {
 	FinishedAt *metav1.Time `json:"finishedAt,omitempty"`
 	// Groups holds per-group and per-app progress, in spec.groups order
 	Groups []ApplicationSyncGroupStatus `json:"groups,omitempty"`
+	// ObservedGeneration is the metadata.generation this status was computed for
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 }
 
 // ApplicationSyncGroupStatus is the progress of one group within an ApplicationSync
@@ -189,6 +204,8 @@ type ApplicationSyncAppStatus struct {
 	// StartedAt and FinishedAt mirror the Application's operationState for this sync
 	StartedAt  *metav1.Time `json:"startedAt,omitempty"`
 	FinishedAt *metav1.Time `json:"finishedAt,omitempty"`
+	// SyncStatus is the app's sync status when it succeeded. With doneWhen: Healthy it can be OutOfSync.
+	SyncStatus argov1alpha1.SyncStatusCode `json:"syncStatus,omitempty"`
 }
 
 // ApplicationSyncPolicyList is a list of ApplicationSyncPolicy resources
@@ -221,6 +238,9 @@ type ApplicationSyncPolicySpec struct {
 	ConcurrencyPolicy ApplicationSyncConcurrencyPolicy `json:"concurrencyPolicy,omitempty"`
 	// Template is the spec of each ApplicationSync the policy creates
 	Template ApplicationSyncSpec `json:"template"`
+	// SelfHeal starts another run for a change the last run already synced successfully, when an app has
+	// drifted since, as automated.selfHeal does. Runs are spaced by Argo CD's self-heal backoff settings.
+	SelfHeal bool `json:"selfHeal,omitempty"`
 }
 
 // ApplicationSyncConcurrencyPolicy is what a policy does when its apps drift during a run
@@ -236,4 +256,8 @@ type ApplicationSyncPolicyStatus struct {
 	// CurrentRun is the name of the ApplicationSync the policy created last
 	CurrentRun string `json:"currentRun,omitempty"`
 	Message    string `json:"message,omitempty"`
+	// SelfHealAttempts counts the self-heal runs started for the current change
+	SelfHealAttempts int64 `json:"selfHealAttempts,omitempty"`
+	// ObservedGeneration is the metadata.generation this status was computed for
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 }

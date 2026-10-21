@@ -1,4 +1,4 @@
-// Command argocd-application-sync-controller runs ApplicationSyncs and ApplicationSyncPolicies against an
+// Command argo-cd-sync-controller runs ApplicationSyncs and ApplicationSyncPolicies against an
 // existing Argo CD installation.
 package main
 
@@ -18,8 +18,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	syncv1alpha1 "github.com/argoproj-labs/argocd-application-sync-crd/api/v1alpha1"
-	"github.com/argoproj-labs/argocd-application-sync-crd/internal/controller"
+	syncv1alpha1 "github.com/argoproj-labs/argo-cd-sync-controller/api/v1alpha1"
+	"github.com/argoproj-labs/argo-cd-sync-controller/internal/controller"
 )
 
 func main() {
@@ -33,7 +33,7 @@ func main() {
 	)
 	flag.StringVar(&argoCDNamespace, "argocd-namespace", "", "Namespace of the Argo CD installation, which holds AppProjects and argocd-cm. Defaults to the controller's own namespace, or the kubeconfig's when run outside a cluster.")
 	flag.StringVar(&namespaces, "namespaces", "", "Comma-separated namespaces to watch for Applications and ApplicationSyncs. Empty watches all namespaces.")
-	flag.IntVar(&historyLimit, "history-limit", 20, "Completed ApplicationSyncs kept per set of apps. 0 keeps them all.")
+	flag.IntVar(&historyLimit, "history-limit", 20, "Completed ApplicationSyncs kept per app. 0 keeps them all.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "Address the metrics endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Address the health probes bind to.")
 	flag.BoolVar(&leaderElect, "leader-elect", true, "Use leader election, so only one replica reconciles at a time.")
@@ -67,7 +67,7 @@ func main() {
 	}}
 	if namespaces != "" {
 		cacheOpts.DefaultNamespaces = map[string]cache.Config{argoCDNamespace: {}}
-		for _, ns := range strings.Split(namespaces, ",") {
+		for ns := range strings.SplitSeq(namespaces, ",") {
 			cacheOpts.DefaultNamespaces[strings.TrimSpace(ns)] = cache.Config{}
 		}
 	}
@@ -77,7 +77,7 @@ func main() {
 		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         leaderElect,
-		LeaderElectionID:       "argocd-application-sync-controller",
+		LeaderElectionID:       "argo-cd-sync-controller",
 	})
 	if err != nil {
 		setupLog.Error(err, "creating manager")
@@ -87,7 +87,7 @@ func main() {
 	if err := (&controller.ApplicationSyncReconciler{
 		Client:          mgr.GetClient(),
 		APIReader:       mgr.GetAPIReader(),
-		Recorder:        mgr.GetEventRecorder("argocd-application-sync-controller"),
+		Recorder:        mgr.GetEventRecorder("argo-cd-sync-controller"),
 		ArgoCDNamespace: argoCDNamespace,
 		HistoryLimit:    historyLimit,
 	}).SetupWithManager(mgr); err != nil {

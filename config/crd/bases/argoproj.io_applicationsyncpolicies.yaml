@@ -60,10 +60,20 @@ spec:
                 - Forbid
                 - Replace
                 type: string
+              selfHeal:
+                description: |-
+                  SelfHeal starts another run for a change the last run already synced successfully, when an app has
+                  drifted since, as automated.selfHeal does. Runs are spaced by Argo CD's self-heal backoff settings.
+                type: boolean
               template:
                 description: Template is the spec of each ApplicationSync the policy
                   creates
                 properties:
+                  allowEmpty:
+                    description: |-
+                      AllowEmpty lets an automated run with prune sync an app whose resources would all be pruned, as
+                      automated.allowEmpty does for auto-sync. An app with no resources at all is never blocked.
+                    type: boolean
                   doneWhen:
                     description: 'DoneWhen decides when an app counts as done: SyncedAndHealthy
                       (default) or Healthy'
@@ -232,17 +242,11 @@ spec:
                       type: object
                     type: array
                   initiatedBy:
-                    description: |-
-                      InitiatedBy is copied into each app's operation. It is informational only and never used for authorization.
-                      When Automated is true, sync windows are checked with automatic semantics.
+                    description: InitiatedBy is copied into each app's operation.
+                      It is informational only and never used for authorization.
                     properties:
-                      automated:
-                        description: Automated is set to true if operation was initiated
-                          automatically by the application controller.
-                        type: boolean
                       username:
-                        description: Username contains the name of a user who started
-                          operation
+                        description: Username of whoever created the ApplicationSync
                         type: string
                     type: object
                   onFailure:
@@ -346,6 +350,16 @@ spec:
                 type: string
               message:
                 type: string
+              observedGeneration:
+                description: ObservedGeneration is the metadata.generation this status
+                  was computed for
+                format: int64
+                type: integer
+              selfHealAttempts:
+                description: SelfHealAttempts counts the self-heal runs started for
+                  the current change
+                format: int64
+                type: integer
             type: object
         required:
         - metadata

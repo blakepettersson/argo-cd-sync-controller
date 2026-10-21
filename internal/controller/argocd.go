@@ -5,11 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"time"
 
 	argov1alpha1 "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -17,13 +20,26 @@ import (
 // This file holds what the controller needs from Argo CD, reached only through the Kubernetes API.
 
 const (
-	argoCDConfigMap       = "argocd-cm"
-	argoCDCmdParamsMap    = "argocd-cmd-params-cm"
-	requireOverrideKey    = "application.sync.requireOverridePrivilegeForRevisionSync"
-	replaceAllowedKey     = "server.sync.replace.allowed"
-	refreshAnnotation     = "argocd.argoproj.io/refresh"
-	operationStartedEvent = "OperationStarted"
+	argoCDConfigMap    = "argocd-cm"
+	argoCDCmdParamsMap = "argocd-cmd-params-cm"
+	requireOverrideKey = "application.sync.requireOverridePrivilegeForRevisionSync"
+	replaceAllowedKey  = "server.sync.replace.allowed"
+	// The application controller's self-heal settings, which policy self-heal follows too.
+	selfHealTimeoutKey        = "controller.self.heal.timeout.seconds"
+	selfHealBackoffTimeoutKey = "controller.self.heal.backoff.timeout.seconds"
+	selfHealBackoffFactorKey  = "controller.self.heal.backoff.factor"
+	selfHealBackoffCapKey     = "controller.self.heal.backoff.cap.seconds"
+	refreshAnnotation         = "argocd.argoproj.io/refresh"
+	operationStartedEvent     = "OperationStarted"
 )
+
+// errAutoSyncEnabled is why an app with Argo CD auto-sync on is never synced: both controllers would sync it.
+var errAutoSyncEnabled = errors.New("auto-sync is enabled on the application; turn it off so only ApplicationSyncs sync it")
+
+// autoSyncEnabled reports whether Argo CD's application controller auto-syncs (and self-heals) app.
+func autoSyncEnabled(app *argov1alpha1.Application) bool {
+	return app.Spec.SyncPolicy != nil && app.Spec.SyncPolicy.IsAutomatedSyncEnabled()
+}
 
 // errAnotherOperationInProgress mirrors the Sync API's error when an app already has an operation.
 var errAnotherOperationInProgress = errors.New("another operation is already in progress")
@@ -65,20 +81,62 @@ func (a *argoCD) getProject(ctx context.Context, app *argov1alpha1.Application) 
 	return &proj, nil
 }
 
-func (a *argoCD) boolSetting(ctx context.Context, configMap, key string, def bool) (bool, error) {
+func (a *argoCD) configMapData(ctx context.Context, configMap string) (map[string]string, error) {
 	var cm corev1.ConfigMap
 	err := a.apiReader.Get(ctx, types.NamespacedName{Namespace: a.namespace, Name: configMap}, &cm)
 	if apierrors.IsNotFound(err) {
-		return def, nil
+		return nil, nil
 	}
+	return cm.Data, err
+}
+
+func (a *argoCD) boolSetting(ctx context.Context, configMap, key string, def bool) (bool, error) {
+	data, err := a.configMapData(ctx, configMap)
 	if err != nil {
 		return false, err
 	}
-	v, ok := cm.Data[key]
-	if !ok || v == "" {
+	if data[key] == "" {
 		return def, nil
 	}
-	return strconv.ParseBool(v)
+	return strconv.ParseBool(data[key])
+}
+
+// selfHealDelay returns how long to wait, after a run that finished at finishedAt, before self-heal attempt
+// attempts+1. It uses the application controller's settings and defaults, so a policy self-heals at the same
+// pace as auto-sync.
+func (a *argoCD) selfHealDelay(ctx context.Context, finishedAt *metav1.Time, attempts int) (time.Duration, error) {
+	data, err := a.configMapData(ctx, argoCDCmdParamsMap)
+	if err != nil {
+		return 0, err
+	}
+	seconds := func(key string, def int) (int, error) {
+		if data[key] == "" {
+			return def, nil
+		}
+		return strconv.Atoi(data[key])
+	}
+	var errs [4]error
+	var timeout, backoffTimeout, factor, backoffCap int
+	timeout, errs[0] = seconds(selfHealTimeoutKey, 0)
+	backoffTimeout, errs[1] = seconds(selfHealBackoffTimeoutKey, 2)
+	factor, errs[2] = seconds(selfHealBackoffFactorKey, 3)
+	backoffCap, errs[3] = seconds(selfHealBackoffCapKey, 300)
+	if err := errors.Join(errs[:]...); err != nil {
+		return 0, fmt.Errorf("reading self-heal settings from %s: %w", argoCDCmdParamsMap, err)
+	}
+	// As in the application controller, a backoff timeout of 0 falls back to the fixed timeout.
+	delay := time.Duration(timeout) * time.Second
+	if backoffTimeout != 0 {
+		backoff := wait.Backoff{Duration: time.Duration(backoffTimeout) * time.Second, Factor: float64(factor), Cap: time.Duration(backoffCap) * time.Second, Steps: attempts}
+		delay = 0
+		for range attempts {
+			delay = backoff.Step()
+		}
+	}
+	if finishedAt != nil {
+		delay -= time.Since(finishedAt.Time)
+	}
+	return delay, nil
 }
 
 // requireOverride reports application.sync.requireOverridePrivilegeForRevisionSync from argocd-cm.

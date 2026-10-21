@@ -6,10 +6,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"time"
 
 	argov1alpha1 "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -18,7 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	syncv1alpha1 "github.com/argoproj-labs/argocd-application-sync-crd/api/v1alpha1"
+	syncv1alpha1 "github.com/argoproj-labs/argo-cd-sync-controller/api/v1alpha1"
 )
 
 const (
@@ -30,6 +33,9 @@ const (
 	// second run for the same revisions and sources (as auto-sync avoids re-syncing a revision it already
 	// attempted).
 	policyChangeAnnotation = "argocd.argoproj.io/application-sync-policy-change"
+	// policyRunAnnotation numbers a policy's runs from 1, so the latest one is known without relying on
+	// creationTimestamp, which only has one-second resolution.
+	policyRunAnnotation = "argocd.argoproj.io/application-sync-policy-run"
 )
 
 // ApplicationSyncPolicyReconciler creates an ApplicationSync from a policy's template when one of its apps is
@@ -83,38 +89,46 @@ func (r *ApplicationSyncPolicyReconciler) Reconcile(ctx context.Context, req ctr
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	orig := p.Status.DeepCopy()
-	if err := r.reconcilePolicy(ctx, &p); err != nil {
+	requeueAfter, err := r.reconcilePolicy(ctx, &p)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
+	p.Status.ObservedGeneration = p.Generation
 	if !equality.Semantic.DeepEqual(*orig, p.Status) {
 		if err := r.Status().Update(ctx, &p); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
-func (r *ApplicationSyncPolicyReconciler) reconcilePolicy(ctx context.Context, p *syncv1alpha1.ApplicationSyncPolicy) error {
+// reconcilePolicy returns how long to wait before looking again, when self-heal is backing off.
+func (r *ApplicationSyncPolicyReconciler) reconcilePolicy(ctx context.Context, p *syncv1alpha1.ApplicationSyncPolicy) (time.Duration, error) {
 	if _, err := groupOrder(p.Spec.Template.Groups); err != nil {
 		p.Status.Message = "invalid template: " + err.Error()
-		return nil
+		return 0, nil
 	}
 	names := appNames(p.Spec.Template)
 	if len(names) == 0 {
 		p.Status.Message = "the template lists no applications"
-		return nil
+		return 0, nil
 	}
 
+	// Found live rather than through status.currentRun: the cached policy can lag behind the status update that
+	// recorded a run just created, or that update can fail, and either way a second run would start.
+	var runs syncv1alpha1.ApplicationSyncList
+	if err := r.APIReader.List(ctx, &runs, client.InNamespace(p.Namespace), client.MatchingLabels{PolicyLabel: p.Name}); err != nil {
+		return 0, err
+	}
 	var current *syncv1alpha1.ApplicationSync
-	if p.Status.CurrentRun != "" {
-		var s syncv1alpha1.ApplicationSync
-		err := r.Get(ctx, types.NamespacedName{Namespace: p.Namespace, Name: p.Status.CurrentRun}, &s)
-		if err != nil && !apierrors.IsNotFound(err) {
-			return err
+	for i := range runs.Items {
+		run := &runs.Items[i]
+		if metav1.IsControlledBy(run, p) && (current == nil || runNumber(current) < runNumber(run)) {
+			current = run
 		}
-		if err == nil {
-			current = &s
-		}
+	}
+	if current != nil {
+		p.Status.CurrentRun = current.Name
 	}
 
 	argo := r.argoCD()
@@ -126,13 +140,17 @@ func (r *ApplicationSyncPolicyReconciler) reconcilePolicy(ctx context.Context, p
 			continue
 		}
 		apps[name] = app
+		if autoSyncEnabled(app) {
+			p.Status.Message = fmt.Sprintf("application %q: %s", name, errAutoSyncEnabled)
+			return 0, nil
+		}
 		// Only act on status computed against the app's current spec.
 		if app.Status.ReconciledAt == nil || !comparedToCurrentSpec(app) {
 			if err := argo.requestRefresh(ctx, app); err != nil {
 				log.FromContext(ctx).Error(err, "requesting refresh", "application", name)
 			}
 			p.Status.Message = fmt.Sprintf("waiting for application %q to be refreshed", name)
-			return nil
+			return 0, nil
 		}
 		if app.Status.Sync.Status == argov1alpha1.SyncStatusCodeOutOfSync {
 			drifted = true
@@ -140,27 +158,46 @@ func (r *ApplicationSyncPolicyReconciler) reconcilePolicy(ctx context.Context, p
 	}
 	if !drifted {
 		p.Status.Message = "all applications are Synced"
-		return nil
+		return 0, nil
 	}
 
 	change := policyChange(names, apps)
+	selfHeal := false
 	if current != nil && current.Annotations[policyChangeAnnotation] == change {
-		// Same revisions and sources as the last run: like auto-sync, don't retry what was already attempted.
-		if current.Status.Phase.Completed() {
-			p.Status.Message = fmt.Sprintf("run %s already handled this change (%s)", current.Name, current.Status.Phase)
-		} else {
+		// Same revisions and sources as the last run: like auto-sync, don't retry what was already attempted,
+		// and only self-heal drift after a run that succeeded.
+		if !current.Status.Phase.Completed() {
 			p.Status.Message = fmt.Sprintf("run %s is in progress", current.Name)
+			return 0, nil
 		}
-		return nil
+		if !p.Spec.SelfHeal || current.Status.Phase != syncv1alpha1.ApplicationSyncPhaseSucceeded {
+			p.Status.Message = fmt.Sprintf("run %s already handled this change (%s)", current.Name, current.Status.Phase)
+			return 0, nil
+		}
+		// Only drift that appeared after the run is healed. An app the run left OutOfSync, as doneWhen: Healthy
+		// allows, would otherwise start a new run on every backoff forever.
+		if name := leftOutOfSync(current, apps); name != "" {
+			p.Status.Message = fmt.Sprintf("run %s left application %q OutOfSync; not self-healing this change", current.Name, name)
+			return 0, nil
+		}
+		remaining, err := argo.selfHealDelay(ctx, current.Status.FinishedAt, int(p.Status.SelfHealAttempts))
+		if err != nil {
+			return 0, err
+		}
+		if remaining > 0 {
+			p.Status.Message = fmt.Sprintf("self-healing drift since run %s in %s", current.Name, remaining.Round(time.Second))
+			return remaining, nil
+		}
+		selfHeal = true
 	}
 	if current != nil && !current.Status.Phase.Completed() {
 		if p.Spec.ConcurrencyPolicy != syncv1alpha1.ApplicationSyncConcurrencyReplace {
 			p.Status.Message = fmt.Sprintf("waiting for run %s to finish before starting the next one", current.Name)
-			return nil
+			return 0, nil
 		}
 		// Operations the old run already started finish; nothing new starts.
 		if err := r.Delete(ctx, current); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("replacing run %s: %w", current.Name, err)
+			return 0, fmt.Errorf("replacing run %s: %w", current.Name, err)
 		}
 	}
 
@@ -168,19 +205,68 @@ func (r *ApplicationSyncPolicyReconciler) reconcilePolicy(ctx context.Context, p
 	run.GenerateName = p.Name + "-"
 	run.Namespace = p.Namespace
 	run.Labels = map[string]string{PolicyLabel: p.Name}
-	run.Annotations = map[string]string{policyChangeAnnotation: change}
+	next := 1
+	if current != nil {
+		next = runNumber(current) + 1
+	}
+	run.Annotations = map[string]string{policyChangeAnnotation: change, policyRunAnnotation: strconv.Itoa(next)}
 	run.Spec = *p.Spec.Template.DeepCopy()
-	run.Spec.InitiatedBy = argov1alpha1.OperationInitiator{Automated: true}
 	pinFromStatus(&run.Spec, apps)
+	if selfHeal {
+		limitToDrift(&run.Spec, apps)
+	}
 	if err := controllerutil.SetControllerReference(p, run, r.Scheme()); err != nil {
-		return err
+		return 0, err
 	}
 	if err := r.Create(ctx, run); err != nil {
-		return fmt.Errorf("creating run: %w", err)
+		return 0, fmt.Errorf("creating run: %w", err)
 	}
 	p.Status.CurrentRun = run.Name
 	p.Status.Message = "started run " + run.Name
-	return nil
+	// A new change resets the count, as a new revision does for auto-sync.
+	if selfHeal {
+		p.Status.SelfHealAttempts++
+	} else {
+		p.Status.SelfHealAttempts = 0
+	}
+	return 0, nil
+}
+
+// leftOutOfSync returns an app that is OutOfSync now and wasn't Synced when run finished with it.
+func leftOutOfSync(run *syncv1alpha1.ApplicationSync, apps map[string]*argov1alpha1.Application) string {
+	for _, g := range run.Status.Groups {
+		for _, st := range g.Apps {
+			if app := apps[st.Name]; app != nil && app.Status.Sync.Status == argov1alpha1.SyncStatusCodeOutOfSync && st.SyncStatus != argov1alpha1.SyncStatusCodeSynced {
+				return st.Name
+			}
+		}
+	}
+	return ""
+}
+
+func runNumber(run *syncv1alpha1.ApplicationSync) int {
+	n, _ := strconv.Atoi(run.Annotations[policyRunAnnotation])
+	return n
+}
+
+// limitToDrift makes a self-heal run sync only what drifted, as automated.selfHeal does: Synced apps are
+// skipped, and the others sync only their resources that aren't Synced. Resources set in the template are kept.
+func limitToDrift(spec *syncv1alpha1.ApplicationSyncSpec, apps map[string]*argov1alpha1.Application) {
+	spec.SkipIfSynced = true
+	for gi := range spec.Groups {
+		for ai := range spec.Groups[gi].Apps {
+			a := &spec.Groups[gi].Apps[ai]
+			app := apps[a.Name]
+			if app == nil || len(a.Resources) > 0 {
+				continue
+			}
+			for _, r := range app.Status.Resources {
+				if r.Status != argov1alpha1.SyncStatusCodeSynced {
+					a.Resources = append(a.Resources, argov1alpha1.SyncOperationResource{Group: r.Group, Kind: r.Kind, Name: r.Name})
+				}
+			}
+		}
+	}
 }
 
 // pinFromStatus pins every source of every app to the revision its latest comparison resolved, so the whole

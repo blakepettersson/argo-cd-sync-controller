@@ -1,0 +1,8 @@
+# The example Applications. The ApplicationSync and ApplicationSyncPolicy are applied separately:
+#   kubectl create -n argocd -f config/samples/applicationsync.yaml
+#   kubectl apply -n argocd -f config/samples/applicationsyncpolicy.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: argocd
+resources:
+- applications.yaml

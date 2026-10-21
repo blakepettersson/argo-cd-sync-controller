@@ -1,0 +1,16 @@
+# Syncs guestbook first, then the other two in parallel. Apply with kubectl create: an ApplicationSync is
+# immutable, so each run is a new object.
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSync
+metadata:
+  generateName: guestbooks-
+spec:
+  groups:
+  - name: first
+    apps:
+    - name: guestbook
+  - name: rest
+    dependsOn: [first]
+    apps:
+    - name: helm-guestbook
+    - name: kustomize-guestbook

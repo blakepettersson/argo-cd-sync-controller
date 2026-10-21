@@ -2,15 +2,17 @@ package controller
 
 import (
 	"testing"
+	"time"
 
 	argov1alpha1 "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	syncv1alpha1 "github.com/argoproj-labs/argocd-application-sync-crd/api/v1alpha1"
+	syncv1alpha1 "github.com/argoproj-labs/argo-cd-sync-controller/api/v1alpha1"
 )
 
 func ctrlRequest(obj client.Object) reconcile.Request {
@@ -80,7 +82,7 @@ func TestPolicyStartsRunOnDrift(t *testing.T) {
 	assert.Equal(t, "platform", run.Labels[PolicyLabel])
 	require.Len(t, run.OwnerReferences, 1)
 	assert.Equal(t, "ApplicationSyncPolicy", run.OwnerReferences[0].Kind)
-	assert.True(t, run.Spec.InitiatedBy.Automated, "policy runs are automatic syncs")
+	assert.True(t, isAutomated(&run), "policy runs are automatic syncs")
 	assert.Equal(t, []syncv1alpha1.ApplicationSyncRevision{{Revision: "aaa111"}}, run.Spec.Groups[0].Apps[0].Revisions)
 	assert.Equal(t, []syncv1alpha1.ApplicationSyncRevision{{Revision: "aaa111"}}, run.Spec.Groups[1].Apps[0].Revisions)
 
@@ -128,4 +130,192 @@ func TestPolicyWaitsForFreshStatus(t *testing.T) {
 	got := reconcilePolicy(t, r, p)
 	assert.Empty(t, listRuns(t, r))
 	assert.Equal(t, `waiting for application "db" to be refreshed`, got.Status.Message)
+}
+
+func TestPolicyRecordsObservedGeneration(t *testing.T) {
+	db, api := testApp("db"), testApp("api")
+	db.Status.Sync.Status = argov1alpha1.SyncStatusCodeSynced
+	api.Status.Sync.Status = argov1alpha1.SyncStatusCodeSynced
+	p := newTestPolicy("")
+	// The fake client doesn't manage metadata.generation, so the test sets it as the API server would.
+	p.Generation = 1
+	r := newTestPolicyReconciler(t, p, db, api)
+
+	got := reconcilePolicy(t, r, p)
+	assert.Equal(t, int64(1), got.Status.ObservedGeneration)
+
+	got.Spec.ConcurrencyPolicy = syncv1alpha1.ApplicationSyncConcurrencyReplace
+	got.Generation = 2
+	require.NoError(t, r.Update(t.Context(), got))
+	got = reconcilePolicy(t, r, got)
+	assert.Equal(t, int64(2), got.Status.ObservedGeneration)
+}
+
+// finishRun marks the policy's current run finished, as the ApplicationSync reconciler would.
+func finishRun(t *testing.T, r *ApplicationSyncPolicyReconciler, p *syncv1alpha1.ApplicationSyncPolicy, phase syncv1alpha1.ApplicationSyncPhase) {
+	t.Helper()
+	var run syncv1alpha1.ApplicationSync
+	require.NoError(t, r.Get(t.Context(), client.ObjectKey{Namespace: p.Namespace, Name: p.Status.CurrentRun}, &run))
+	run.Status.Phase = phase
+	run.Status.FinishedAt = new(metav1.Now())
+	require.NoError(t, r.Status().Update(t.Context(), &run))
+}
+
+func getRun(t *testing.T, r *ApplicationSyncPolicyReconciler, name string) syncv1alpha1.ApplicationSync {
+	t.Helper()
+	var run syncv1alpha1.ApplicationSync
+	require.NoError(t, r.Get(t.Context(), client.ObjectKey{Namespace: testNamespace, Name: name}, &run))
+	return run
+}
+
+func TestPolicySelfHeal(t *testing.T) {
+	db, api := testApp("db"), testApp("api")
+	db.Status.Sync.Revision = "aaa111"
+	api.Status.Sync.Status = argov1alpha1.SyncStatusCodeSynced
+	api.Status.Sync.Revision = "aaa111"
+	p := newTestPolicy("")
+	p.Spec.SelfHeal = true
+	r := newTestPolicyReconciler(t, p, db, api)
+
+	got := reconcilePolicy(t, r, p)
+	first := got.Status.CurrentRun
+	finishRun(t, r, got, syncv1alpha1.ApplicationSyncPhaseSucceeded)
+
+	// Someone edits a live resource: same revisions and sources, but db is OutOfSync again.
+	updateTestApp(t, r.Client, "db", func(app *argov1alpha1.Application) {
+		app.Status.Resources = []argov1alpha1.ResourceStatus{
+			{Group: "apps", Kind: "Deployment", Name: "db", Status: argov1alpha1.SyncStatusCodeOutOfSync},
+			{Kind: "Service", Name: "db", Status: argov1alpha1.SyncStatusCodeSynced},
+		}
+	})
+	got = reconcilePolicy(t, r, got)
+	require.NotEqual(t, first, got.Status.CurrentRun, "a drift after a successful run is self-healed")
+	assert.Equal(t, int64(1), got.Status.SelfHealAttempts)
+	heal := getRun(t, r, got.Status.CurrentRun)
+	assert.True(t, heal.Spec.SkipIfSynced, "apps that are still Synced aren't synced again")
+	assert.Equal(t, []syncv1alpha1.ApplicationSyncRevision{{Revision: "aaa111"}}, heal.Spec.Groups[0].Apps[0].Revisions, "the same change is pinned")
+	assert.Equal(t, []argov1alpha1.SyncOperationResource{{Group: "apps", Kind: "Deployment", Name: "db"}}, heal.Spec.Groups[0].Apps[0].Resources, "only drifted resources are synced")
+
+	// A failed self-heal is not retried, as auto-sync doesn't retry a failed sync of the same revision.
+	finishRun(t, r, got, syncv1alpha1.ApplicationSyncPhaseFailed)
+	got = reconcilePolicy(t, r, got)
+	assert.Len(t, listRuns(t, r), 2)
+	assert.Contains(t, got.Status.Message, "already handled this change")
+
+	// A new change resets the count.
+	updateTestApp(t, r.Client, "db", func(app *argov1alpha1.Application) { app.Status.Sync.Revision = "bbb222" })
+	got = reconcilePolicy(t, r, got)
+	assert.Len(t, listRuns(t, r), 3)
+	assert.Equal(t, int64(0), got.Status.SelfHealAttempts)
+}
+
+func TestPolicySelfHealBackoff(t *testing.T) {
+	db := testApp("db")
+	db.Status.Sync.Revision = "aaa111"
+	p := newTestPolicy("")
+	p.Spec.SelfHeal = true
+	params := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: argoCDCmdParamsMap, Namespace: testNamespace},
+		Data:       map[string]string{selfHealBackoffTimeoutKey: "3600", selfHealBackoffFactorKey: "1", selfHealBackoffCapKey: "3600"},
+	}
+	base := newTestReconciler(t, withApps([]client.Object{testProject(nil), p, params}, db, testApp("api"))...)
+	r := &ApplicationSyncPolicyReconciler{Client: base.Client, APIReader: base.APIReader, ArgoCDNamespace: testNamespace}
+
+	got := reconcilePolicy(t, r, p)
+	finishRun(t, r, got, syncv1alpha1.ApplicationSyncPhaseSucceeded)
+	// The first self-heal starts right away, as auto-sync's does.
+	got = reconcilePolicy(t, r, got)
+	require.Len(t, listRuns(t, r), 2)
+	finishRun(t, r, got, syncv1alpha1.ApplicationSyncPhaseSucceeded)
+
+	// The next one waits for the backoff, and the policy is requeued for when it ends.
+	res, err := r.Reconcile(t.Context(), ctrlRequest(got))
+	require.NoError(t, err)
+	assert.InDelta(t, time.Hour.Seconds(), res.RequeueAfter.Seconds(), 60)
+	require.NoError(t, r.Get(t.Context(), client.ObjectKeyFromObject(got), got))
+	assert.Len(t, listRuns(t, r), 2)
+	assert.Contains(t, got.Status.Message, "self-healing drift since run")
+	assert.Equal(t, int64(1), got.Status.SelfHealAttempts)
+}
+
+func TestPolicyNoSelfHeal(t *testing.T) {
+	db := testApp("db")
+	db.Status.Sync.Revision = "aaa111"
+	p := newTestPolicy("")
+	r := newTestPolicyReconciler(t, p, db, testApp("api"))
+
+	got := reconcilePolicy(t, r, p)
+	finishRun(t, r, got, syncv1alpha1.ApplicationSyncPhaseSucceeded)
+	got = reconcilePolicy(t, r, got)
+	assert.Len(t, listRuns(t, r), 1, "without selfHeal, drift at the same change is left alone")
+	assert.Contains(t, got.Status.Message, "already handled this change")
+}
+
+func TestPolicyRefusesAutoSyncedApp(t *testing.T) {
+	db := testApp("db")
+	db.Spec.SyncPolicy = &argov1alpha1.SyncPolicy{Automated: &argov1alpha1.SyncPolicyAutomated{}}
+	p := newTestPolicy("")
+	r := newTestPolicyReconciler(t, p, db, testApp("api"))
+
+	got := reconcilePolicy(t, r, p)
+	assert.Empty(t, listRuns(t, r))
+	assert.Contains(t, got.Status.Message, `application "db": auto-sync is enabled`)
+}
+
+// TestPolicyIgnoresStaleCurrentRun covers a cached policy that hasn't caught up with the status update recording
+// the run it just created: it must not start a second run for the same change.
+func TestPolicyIgnoresStaleCurrentRun(t *testing.T) {
+	db := testApp("db")
+	db.Status.Sync.Revision = "aaa111"
+	p := newTestPolicy("")
+	r := newTestPolicyReconciler(t, p, db, testApp("api"))
+
+	stale := p.DeepCopy()
+	_, err := r.reconcilePolicy(t.Context(), p)
+	require.NoError(t, err)
+	require.Len(t, listRuns(t, r), 1)
+	assert.Equal(t, "1", listRuns(t, r)[0].Annotations[policyRunAnnotation])
+
+	_, err = r.reconcilePolicy(t.Context(), stale)
+	require.NoError(t, err)
+	runs := listRuns(t, r)
+	require.Len(t, runs, 1)
+	assert.Contains(t, stale.Status.Message, "is in progress")
+	assert.Equal(t, runs[0].Name, stale.Status.CurrentRun, "a lost status update is repaired")
+}
+
+// TestPolicySelfHealSkipsAppsLeftOutOfSync covers doneWhen: Healthy, where a run can succeed with an app still
+// OutOfSync. That isn't drift, so self-healing it would start a new run on every backoff.
+func TestPolicySelfHealSkipsAppsLeftOutOfSync(t *testing.T) {
+	for _, tc := range []struct {
+		endedWith argov1alpha1.SyncStatusCode
+		runs      int
+	}{
+		{argov1alpha1.SyncStatusCodeOutOfSync, 1},
+		{argov1alpha1.SyncStatusCodeSynced, 2},
+	} {
+		t.Run(string(tc.endedWith), func(t *testing.T) {
+			db := testApp("db")
+			db.Status.Sync.Revision = "aaa111"
+			p := newTestPolicy("")
+			p.Spec.SelfHeal = true
+			r := newTestPolicyReconciler(t, p, db, testApp("api"))
+
+			got := reconcilePolicy(t, r, p)
+			var run syncv1alpha1.ApplicationSync
+			require.NoError(t, r.Get(t.Context(), client.ObjectKey{Namespace: testNamespace, Name: got.Status.CurrentRun}, &run))
+			run.Status.Phase = syncv1alpha1.ApplicationSyncPhaseSucceeded
+			run.Status.FinishedAt = new(metav1.Now())
+			run.Status.Groups = []syncv1alpha1.ApplicationSyncGroupStatus{{Name: "data", Phase: syncv1alpha1.ApplicationSyncPhaseSucceeded, Apps: []syncv1alpha1.ApplicationSyncAppStatus{
+				{Name: "db", Phase: syncv1alpha1.ApplicationSyncPhaseSucceeded, SyncStatus: tc.endedWith},
+			}}}
+			require.NoError(t, r.Status().Update(t.Context(), &run))
+
+			got = reconcilePolicy(t, r, got)
+			assert.Len(t, listRuns(t, r), tc.runs)
+			if tc.runs == 1 {
+				assert.Contains(t, got.Status.Message, `left application "db" OutOfSync`)
+			}
+		})
+	}
 }

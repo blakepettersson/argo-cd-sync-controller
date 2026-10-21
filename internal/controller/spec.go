@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/utils/text"
@@ -14,7 +14,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	syncv1alpha1 "github.com/argoproj-labs/argocd-application-sync-crd/api/v1alpha1"
+	syncv1alpha1 "github.com/argoproj-labs/argo-cd-sync-controller/api/v1alpha1"
 )
 
 // groupOrder returns indexes into groups in dependency order, or an error if dependsOn names an unknown group,
@@ -199,7 +199,8 @@ func (r *ApplicationSyncReconciler) checkRevisions(ctx context.Context, s *syncv
 	return requested, nil
 }
 
-// gc deletes the completed ApplicationSyncs for the same set of apps as s beyond the newest HistoryLimit.
+// gc deletes completed ApplicationSyncs that are no longer among the newest HistoryLimit for any of their apps, so
+// each app keeps its last HistoryLimit syncs and the total is bounded by HistoryLimit per app.
 func (r *ApplicationSyncReconciler) gc(ctx context.Context, s *syncv1alpha1.ApplicationSync) {
 	if r.HistoryLimit <= 0 {
 		return
@@ -208,16 +209,11 @@ func (r *ApplicationSyncReconciler) gc(ctx context.Context, s *syncv1alpha1.Appl
 	if err := r.List(ctx, &list, client.InNamespace(s.Namespace)); err != nil {
 		return
 	}
-	key := historyKey(s.Spec)
 	var completed []*syncv1alpha1.ApplicationSync
 	for i := range list.Items {
-		c := &list.Items[i]
-		if c.Status.Phase.Completed() && historyKey(c.Spec) == key {
-			completed = append(completed, c)
+		if list.Items[i].Status.Phase.Completed() {
+			completed = append(completed, &list.Items[i])
 		}
-	}
-	if len(completed) <= r.HistoryLimit {
-		return
 	}
 	sort.Slice(completed, func(i, j int) bool {
 		ti, tj := finishedAt(completed[i]), finishedAt(completed[j])
@@ -226,19 +222,23 @@ func (r *ApplicationSyncReconciler) gc(ctx context.Context, s *syncv1alpha1.Appl
 		}
 		return completed[i].Name > completed[j].Name
 	})
-	for _, c := range completed[r.HistoryLimit:] {
+	newer := map[string]int{} // completed runs seen so far, newest first, per app
+	for _, c := range completed {
+		keep := false
+		for _, name := range slices.Compact(slices.Sorted(slices.Values(appNames(c.Spec)))) {
+			if newer[name] < r.HistoryLimit {
+				keep = true
+			}
+			newer[name]++
+		}
+		if keep {
+			continue
+		}
 		err := r.Delete(ctx, c, client.Preconditions{UID: &c.UID})
 		if err != nil && !apierrors.IsNotFound(err) {
 			log.FromContext(ctx).Error(err, "garbage collecting ApplicationSync", "applicationsync", c.Name)
 		}
 	}
-}
-
-// historyKey identifies the set of apps a spec syncs, independent of how they are grouped or ordered.
-func historyKey(spec syncv1alpha1.ApplicationSyncSpec) string {
-	names := appNames(spec)
-	sort.Strings(names)
-	return strings.Join(names, ",")
 }
 
 func finishedAt(s *syncv1alpha1.ApplicationSync) time.Time {
@@ -247,4 +247,3 @@ func finishedAt(s *syncv1alpha1.ApplicationSync) time.Time {
 	}
 	return s.CreationTimestamp.Time
 }
-

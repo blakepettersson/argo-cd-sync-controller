@@ -1,4 +1,4 @@
-# argocd-application-sync-crd
+# argo-cd-sync-controller
 
 A controller that syncs Argo CD Applications in dependency order, driven by two resources:
 
@@ -52,8 +52,11 @@ under `status.groups`.
 ## Behavior
 
 - **No auto-sync.** Applications in an ApplicationSync or an ApplicationSyncPolicy must not have auto-sync
-  enabled. Auto-sync would sync an app ahead of the groups it depends on, or undo a pinned revision. To keep a
-  group of apps in sync automatically, use an ApplicationSyncPolicy instead.
+  enabled. Auto-sync would sync an app ahead of the groups it depends on, or undo a pinned revision. The
+  controller enforces this: an app with auto-sync on fails (or waits, with `onFailure: Wait`) without being
+  synced, and a policy starts no run while any of its apps has it on. To keep a group of apps in sync
+  automatically, use an ApplicationSyncPolicy instead, with `selfHeal` if drift should be reverted. Nothing is
+  read from an app's own `syncPolicy.automated`.
 - **Waiting.** An app that doesn't exist yet, or already has an operation running, waits.
 - **Health gate.** An app is done once its sync succeeded and it is Synced and Healthy. That status is only
   trusted once `status.sync.comparedTo` shows the app's current spec, and the controller requests a refresh
@@ -62,8 +65,18 @@ under `status.groups`.
   on it are Skipped. With `onFailure: Wait`, a failed or Degraded app keeps its dependents waiting until it
   recovers.
 - **Sync windows** are enforced. A closed window keeps the app Pending without starting a sync.
+- **Automatic runs.** Only runs owned by an ApplicationSyncPolicy are automatic: sync windows apply to them as to
+  auto-sync, and with prune on, an app whose resources would all be pruned fails without syncing. Every other run
+  is manual.
 - **Immutability.** `spec` is immutable, except `spec.paused`.
-- **History.** The 20 most recent completed ApplicationSyncs are kept per set of apps (`--history-limit`).
+- **Self-heal.** A policy with `selfHeal: true` starts another run for the same change when an app drifts after a
+  successful run, syncing only the resources that aren't Synced. Runs are spaced by the same
+  `controller.self.heal.*` settings in `argocd-cmd-params-cm` that Argo CD's auto-sync uses. An app the run left
+  OutOfSync, as `doneWhen: Healthy` allows, isn't treated as drift.
+- **Observed generation.** Both resources set `status.observedGeneration`, so you can tell when a `paused` change
+  or a policy edit has been picked up.
+- **History.** Each app keeps its 20 most recent completed ApplicationSyncs (`--history-limit`); a run is deleted
+  once it is among the newest 20 for none of its apps.
 
 | Field | Effect |
 |---|---|
@@ -72,7 +85,7 @@ under `status.groups`.
 | `groups[].apps[].prune`, `.retry`, `.resources` | Per-app prune, retry and partial sync. |
 | `doneWhen: Healthy` | Healthy is enough; OutOfSync doesn't block. |
 | `skipIfSynced: true` | Apps that are already Synced aren't synced again. |
-| `initiatedBy.automated: true` | Sync windows apply as they do to auto-sync. |
+| `allowEmpty: true` | Lets an automatic run with prune delete every resource of an app, like `automated.allowEmpty`. An app with no resources never needs it. |
 
 ## Authorization
 
@@ -99,11 +112,33 @@ The image in `config/manager` is a placeholder until the project publishes image
 
 ## Development
 
+The project is meant to move into Argo CD, so it follows Argo CD's conventions: the same `.golangci.yaml`,
+the same `make` target names, the same CI checks, and semantic PR titles (`feat:`, `fix:`, `docs:`, ...).
+
 ```bash
-make generate manifests   # deepcopy, CRDs and ClusterRole from the kubebuilder markers
-make test
-make run                  # run against the current kubeconfig context
+make codegen-local        # deepcopy, CRDs and ClusterRole from the kubebuilder markers
+make build-local
+make lint-local           # golangci-lint with Argo CD's config, applying fixes
+make test-local           # TEST_MODULE=./internal/controller for one package
+make pre-commit-local     # all of the above; run it before committing
 ```
+
+### Running everything locally
+
+Like Argo CD's `make start-local`, this runs the processes in `Procfile` with
+[goreman](https://github.com/mattn/goreman):
+
+```bash
+make start-test-k8s       # k3d cluster with the Argo CD release from go.mod, and the CRDs
+make start-local          # the controller, and the Argo CD UI on https://localhost:8443
+kubectl apply -k config/samples                          # example Applications, auto-sync off
+kubectl create -n argocd -f config/samples/applicationsync.yaml
+```
+
+To run against Argo CD built from source instead, start it with `make start-local` in an argo-cd checkout, then
+run only the controller here with `make start-local START=controller`. The controller's metrics and probes
+listen on `:18080` and `:18081`, so they don't clash with Argo CD's ports. `ARGOCD_APPLICATION_NAMESPACES` is
+passed to the controller's `--namespaces`, as for Argo CD.
 
 It depends on Argo CD v3.5.3 for its API types. Two things come with that:
 

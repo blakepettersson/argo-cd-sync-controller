@@ -23,7 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	syncv1alpha1 "github.com/argoproj-labs/argocd-application-sync-crd/api/v1alpha1"
+	syncv1alpha1 "github.com/argoproj-labs/argo-cd-sync-controller/api/v1alpha1"
 )
 
 const (
@@ -41,7 +41,7 @@ type ApplicationSyncReconciler struct {
 	Recorder  events.EventRecorder
 	// ArgoCDNamespace holds AppProjects and Argo CD's ConfigMaps.
 	ArgoCDNamespace string
-	// HistoryLimit caps completed ApplicationSyncs kept per set of apps; 0 keeps them all.
+	// HistoryLimit caps completed ApplicationSyncs kept per app; 0 keeps them all.
 	HistoryLimit int
 }
 
@@ -91,18 +91,21 @@ func (r *ApplicationSyncReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	if err := r.Get(ctx, req.NamespacedName, &s); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	if s.Status.Phase.Completed() {
-		return ctrl.Result{}, nil
-	}
 	orig := s.Status.DeepCopy()
-	r.reconcileApplicationSync(ctx, &s)
+	// Nothing changes once finished, but a later spec.paused edit is still recorded as observed.
+	if !orig.Phase.Completed() {
+		r.reconcileApplicationSync(ctx, &s)
+	}
+	s.Status.ObservedGeneration = s.Generation
 	if !equality.Semantic.DeepEqual(*orig, s.Status) {
 		if err := r.Status().Update(ctx, &s); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
 	if s.Status.Phase.Completed() {
-		r.gc(ctx, &s)
+		if !orig.Phase.Completed() {
+			r.gc(ctx, &s)
+		}
 		return ctrl.Result{}, nil
 	}
 	return ctrl.Result{RequeueAfter: resyncPeriod}, nil
@@ -309,6 +312,11 @@ func (r *ApplicationSyncReconciler) reconcileApp(ctx context.Context, s *syncv1a
 			st.Message = ""
 			return
 		}
+		// Argo CD's auto-sync and self-heal would otherwise sync the app too, ahead of its group or away from a pin.
+		if autoSyncEnabled(app) {
+			fail(errAutoSyncEnabled.Error())
+			return
+		}
 		if err := checkSources(app, spec, st.PinnedRevisions); err != nil {
 			fail(err.Error())
 			return
@@ -330,6 +338,16 @@ func (r *ApplicationSyncReconciler) reconcileApp(ctx context.Context, s *syncv1a
 				st.Phase = syncv1alpha1.ApplicationSyncPhaseProgressing
 				st.Revisions = app.Status.GetRevisions()
 				st.Message = "already synced"
+				return
+			}
+		}
+		if checksEmpty(s, spec) {
+			if !r.isFresh(ctx, app, s.Status.StartedAt) {
+				st.Message = "waiting for application to be refreshed"
+				return
+			}
+			if prunesEverything(app) {
+				fail("sync would prune every resource of the application; set allowEmpty to allow it")
 				return
 			}
 		}
@@ -439,6 +457,7 @@ func (r *ApplicationSyncReconciler) reconcileApp(ctx context.Context, s *syncv1a
 			return
 		}
 		st.Phase = syncv1alpha1.ApplicationSyncPhaseSucceeded
+		st.SyncStatus = app.Status.Sync.Status
 		st.Message = ""
 	}
 }
@@ -466,13 +485,37 @@ func revisionsMatch(want, actual []string) bool {
 	return true
 }
 
+// checksEmpty reports whether an app's sync must not prune every resource, as auto-sync checks unless
+// automated.allowEmpty is set. Manual syncs aren't checked, and a dry run deletes nothing.
+func checksEmpty(s *syncv1alpha1.ApplicationSync, spec syncv1alpha1.ApplicationSyncApp) bool {
+	prune := s.Spec.Prune
+	if spec.Prune != nil {
+		prune = *spec.Prune
+	}
+	return isAutomated(s) && prune && !s.Spec.AllowEmpty && !s.Spec.DryRun
+}
+
+// prunesEverything reports whether every resource of app would be pruned. Unlike auto-sync, an app with no
+// resources passes, since there is nothing to prune (argoproj/argo-cd#15371).
+func prunesEverything(app *argov1alpha1.Application) bool {
+	if len(app.Status.Resources) == 0 {
+		return false
+	}
+	for _, r := range app.Status.Resources {
+		if !r.RequiresPruning {
+			return false
+		}
+	}
+	return true
+}
+
 // windowBlocks returns a message if a sync window stops app from syncing right now.
 func (r *ApplicationSyncReconciler) windowBlocks(ctx context.Context, s *syncv1alpha1.ApplicationSync, app *argov1alpha1.Application) (string, error) {
 	proj, err := r.argoCD().getProject(ctx, app)
 	if err != nil {
 		return "", err
 	}
-	canSync, err := proj.Spec.SyncWindows.Matches(app).CanSync(!s.Spec.InitiatedBy.Automated, nil)
+	canSync, err := proj.Spec.SyncWindows.Matches(app).CanSync(!isAutomated(s), nil)
 	if err != nil {
 		return "", fmt.Errorf("invalid sync window: %w", err)
 	}
@@ -531,8 +574,11 @@ func (r *ApplicationSyncReconciler) startOperation(ctx context.Context, s *syncv
 			SyncStrategy: s.Spec.SyncStrategy,
 			Resources:    spec.Resources,
 		},
-		InitiatedBy: s.Spec.InitiatedBy,
-		Info:        append([]*argov1alpha1.Info{{Name: syncv1alpha1.ApplicationSyncOperationInfoName, Value: s.Name}}, s.Spec.Info...),
+		InitiatedBy: argov1alpha1.OperationInitiator{Username: s.Spec.InitiatedBy.Username, Automated: isAutomated(s)},
+		Info: append([]*argov1alpha1.Info{
+			{Name: syncv1alpha1.ApplicationSyncOperationInfoName, Value: s.Name},
+			{Name: syncv1alpha1.ApplicationSyncOperationUIDInfoName, Value: string(s.UID)},
+		}, s.Spec.Info...),
 	}
 	// An empty entry leaves the source on its targetRevision, resolved when the sync starts.
 	if app.Spec.HasMultipleSources() {
@@ -557,11 +603,17 @@ func (r *ApplicationSyncReconciler) startOperation(ctx context.Context, s *syncv
 // operationStateFor returns app's operationState if s requested it.
 func operationStateFor(s *syncv1alpha1.ApplicationSync, app *argov1alpha1.Application) *argov1alpha1.OperationState {
 	state := app.Status.OperationState
-	// StartedAt guards against a same-named ApplicationSync that was deleted and recreated.
-	if state == nil || !isOperationFor(s, &state.Operation) || state.StartedAt.Before(&s.CreationTimestamp) {
+	if state == nil || !isOperationFor(s, &state.Operation) {
 		return nil
 	}
 	return state
+}
+
+// isAutomated reports whether s is an automatic run, which only a run owned by an ApplicationSyncPolicy is. Claiming
+// that owner falsely only subjects the run to more restrictions, so the owner reference needs no further check.
+func isAutomated(s *syncv1alpha1.ApplicationSync) bool {
+	owner := metav1.GetControllerOf(s)
+	return owner != nil && owner.APIVersion == syncv1alpha1.GroupVersion.String() && owner.Kind == "ApplicationSyncPolicy"
 }
 
 func isOperationFor(s *syncv1alpha1.ApplicationSync, op *argov1alpha1.Operation) bool {
@@ -569,7 +621,7 @@ func isOperationFor(s *syncv1alpha1.ApplicationSync, op *argov1alpha1.Operation)
 		return false
 	}
 	for _, i := range op.Info {
-		if i != nil && i.Name == syncv1alpha1.ApplicationSyncOperationInfoName && i.Value == s.Name {
+		if i != nil && i.Name == syncv1alpha1.ApplicationSyncOperationUIDInfoName && i.Value == string(s.UID) {
 			return true
 		}
 	}

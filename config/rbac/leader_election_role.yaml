@@ -1,7 +1,7 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: argocd-application-sync-controller-leader-election
+  name: argo-cd-sync-controller-leader-election
 rules:
 - apiGroups: ["coordination.k8s.io"]
   resources: ["leases"]

@@ -1,4 +1,4 @@
-module github.com/argoproj-labs/argocd-application-sync-crd
+module github.com/argoproj-labs/argo-cd-sync-controller
 
 go 1.26.3
 

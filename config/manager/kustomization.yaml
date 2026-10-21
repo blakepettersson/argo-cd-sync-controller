@@ -4,5 +4,5 @@ resources:
 - manager.yaml
 images:
 - name: controller
-  newName: quay.io/argoprojlabs/argocd-application-sync-controller
+  newName: quay.io/argoprojlabs/argo-cd-sync-controller
   newTag: latest

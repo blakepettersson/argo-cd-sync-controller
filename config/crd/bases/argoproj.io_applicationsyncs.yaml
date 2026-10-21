@@ -55,6 +55,11 @@ spec:
             description: Every field except paused is immutable. CEL can't compare
               a struct minus one field, so each is listed.
             properties:
+              allowEmpty:
+                description: |-
+                  AllowEmpty lets an automated run with prune sync an app whose resources would all be pruned, as
+                  automated.allowEmpty does for auto-sync. An app with no resources at all is never blocked.
+                type: boolean
               doneWhen:
                 description: 'DoneWhen decides when an app counts as done: SyncedAndHealthy
                   (default) or Healthy'
@@ -223,17 +228,11 @@ spec:
                   type: object
                 type: array
               initiatedBy:
-                description: |-
-                  InitiatedBy is copied into each app's operation. It is informational only and never used for authorization.
-                  When Automated is true, sync windows are checked with automatic semantics.
+                description: InitiatedBy is copied into each app's operation. It is
+                  informational only and never used for authorization.
                 properties:
-                  automated:
-                    description: Automated is set to true if operation was initiated
-                      automatically by the application controller.
-                    type: boolean
                   username:
-                    description: Username contains the name of a user who started
-                      operation
+                    description: Username of whoever created the ApplicationSync
                     type: string
                 type: object
               onFailure:
@@ -341,7 +340,8 @@ spec:
                 == oldSelf.onFailure) && has(self.doneWhen) == has(oldSelf.doneWhen)
                 && (!has(self.doneWhen) || self.doneWhen == oldSelf.doneWhen) && has(self.skipIfSynced)
                 == has(oldSelf.skipIfSynced) && (!has(self.skipIfSynced) || self.skipIfSynced
-                == oldSelf.skipIfSynced)
+                == oldSelf.skipIfSynced) && has(self.allowEmpty) == has(oldSelf.allowEmpty)
+                && (!has(self.allowEmpty) || self.allowEmpty == oldSelf.allowEmpty)
           status:
             description: ApplicationSyncStatus is the observed progress of an ApplicationSync
             properties:
@@ -392,6 +392,10 @@ spec:
                               operationState for this sync
                             format: date-time
                             type: string
+                          syncStatus:
+                            description: 'SyncStatus is the app''s sync status when
+                              it succeeded. With doneWhen: Healthy it can be OutOfSync.'
+                            type: string
                         required:
                         - name
                         - phase
@@ -412,6 +416,11 @@ spec:
                 type: array
               message:
                 type: string
+              observedGeneration:
+                description: ObservedGeneration is the metadata.generation this status
+                  was computed for
+                format: int64
+                type: integer
               phase:
                 description: ApplicationSyncPhase is the phase of an ApplicationSync,
                   or of one of its groups or Applications

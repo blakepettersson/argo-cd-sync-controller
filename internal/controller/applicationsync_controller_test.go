@@ -19,7 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	syncv1alpha1 "github.com/argoproj-labs/argocd-application-sync-crd/api/v1alpha1"
+	syncv1alpha1 "github.com/argoproj-labs/argo-cd-sync-controller/api/v1alpha1"
 )
 
 const testNamespace = "argocd"
@@ -129,10 +129,32 @@ func newSync(groups ...syncv1alpha1.ApplicationSyncGroup) *syncv1alpha1.Applicat
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              "rollout",
 			Namespace:         testNamespace,
+			UID:               "rollout-uid",
 			CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Minute)),
 		},
 		Spec: syncv1alpha1.ApplicationSyncSpec{Groups: groups, Prune: true},
 	}
+}
+
+// ownByPolicy makes s a policy's run, which is what makes a run automatic.
+func ownByPolicy(s *syncv1alpha1.ApplicationSync) {
+	s.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: syncv1alpha1.GroupVersion.String(), Kind: "ApplicationSyncPolicy", Name: "platform", UID: "policy-uid",
+		Controller: new(true),
+	}}
+}
+
+func TestOnlyPolicyRunsAreAutomatic(t *testing.T) {
+	s := newSync(group("data", nil, "db"))
+	assert.False(t, isAutomated(s), "no owner")
+	s.OwnerReferences = []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: "x", Controller: new(true)}}
+	assert.False(t, isAutomated(s), "owned by something else")
+	ownByPolicy(s)
+	assert.True(t, isAutomated(s))
+
+	r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, testApp("db"))...)
+	r.reconcileApplicationSync(t.Context(), s)
+	assert.True(t, getTestApp(t, r.Client, "db").Operation.InitiatedBy.Automated, "the operation is marked automatic")
 }
 
 func appPhases(s *syncv1alpha1.ApplicationSync) map[string]syncv1alpha1.ApplicationSyncPhase {
@@ -339,6 +361,9 @@ func TestDoneWhen(t *testing.T) {
 			})
 			r.reconcileApplicationSync(t.Context(), s)
 			assert.Equal(t, tc.want, appStatus(t, s, "db").Phase)
+			if tc.want == syncv1alpha1.ApplicationSyncPhaseSucceeded {
+				assert.Equal(t, argov1alpha1.SyncStatusCodeOutOfSync, appStatus(t, s, "db").SyncStatus, "the sync status it ended with is recorded")
+			}
 		})
 	}
 }
@@ -418,7 +443,7 @@ func TestOperationFields(t *testing.T) {
 	g.Apps[0].Retry = &argov1alpha1.RetryStrategy{Limit: 5}
 	g.Apps[0].Resources = []argov1alpha1.SyncOperationResource{{Kind: "Deployment", Name: "guestbook-ui"}}
 	s := newSync(g)
-	s.Spec.InitiatedBy = argov1alpha1.OperationInitiator{Username: "ci", Automated: true}
+	s.Spec.InitiatedBy = syncv1alpha1.ApplicationSyncInitiator{Username: "ci"}
 	s.Spec.Info = []*argov1alpha1.Info{{Name: "Reason", Value: "release"}}
 
 	r.reconcileApplicationSync(t.Context(), s)
@@ -427,8 +452,8 @@ func TestOperationFields(t *testing.T) {
 	assert.False(t, op.Sync.Prune, "the per-app prune overrides spec.prune")
 	assert.Equal(t, int64(5), op.Retry.Limit)
 	assert.Equal(t, g.Apps[0].Resources, op.Sync.Resources)
-	assert.Equal(t, s.Spec.InitiatedBy, op.InitiatedBy)
-	assert.Equal(t, s.Spec.Info, op.Info[1:], "spec.info follows the ApplicationSync tag")
+	assert.Equal(t, argov1alpha1.OperationInitiator{Username: "ci"}, op.InitiatedBy, "a run no policy owns is manual")
+	assert.Equal(t, s.Spec.Info, op.Info[2:], "spec.info follows the ApplicationSync name and UID tags")
 }
 
 func TestRevisions(t *testing.T) {
@@ -518,7 +543,8 @@ func TestReconcileWritesStatusAndGarbageCollects(t *testing.T) {
 	current := newSync(group("data", nil, "db"))
 	current.Name = "current"
 	current.Spec.SkipIfSynced = true
-	r := newTestReconciler(t, testProject(nil), app, current, completed("old-1", 1, "db"), completed("old-2", 2, "db"), completed("pair", 1, "db", "web"))
+	r := newTestReconciler(t, testProject(nil), app, current, completed("old-1", 1, "db"), completed("old-2", 2, "db"),
+		completed("pair", 1, "db", "web"), completed("web-only", 3, "web"), completed("pair-old", 0, "db", "web"))
 	r.HistoryLimit = 2
 
 	_, err := r.Reconcile(t.Context(), ctrlRequest(current))
@@ -534,6 +560,111 @@ func TestReconcileWritesStatusAndGarbageCollects(t *testing.T) {
 	for _, s := range list.Items {
 		names = append(names, s.Name)
 	}
-	// {db} keeps the newest two (current, old-2); {db, web} is a different set of apps.
-	assert.ElementsMatch(t, []string{"current", "old-2", "pair"}, names)
+	// Each app keeps its newest two: db keeps current and old-2, web keeps web-only and pair. pair-old is among
+	// neither app's newest two, even though it is one of only two runs for the set {db, web}.
+	assert.ElementsMatch(t, []string{"current", "old-2", "pair", "web-only"}, names)
+}
+
+func TestOperationFromRecreatedApplicationSyncIsNotAdopted(t *testing.T) {
+	r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, testApp("db"))...)
+	old := newSync(group("data", nil, "db"))
+	old.UID = "old-uid"
+	r.reconcileApplicationSync(t.Context(), old)
+	require.True(t, isOperationFor(old, getTestApp(t, r.Client, "db").Operation))
+	// The application controller starts the old run's operation only after the same-named run was recreated.
+	finishOperation(t, r.Client, "db", synccommon.OperationSucceeded, health.HealthStatusHealthy)
+
+	recreated := newSync(group("data", nil, "db"))
+	db := getTestApp(t, r.Client, "db")
+	assert.False(t, isOperationFor(recreated, &db.Status.OperationState.Operation))
+	assert.Nil(t, operationStateFor(recreated, db), "the result belongs to the deleted run")
+}
+
+func TestReconcileRecordsObservedGeneration(t *testing.T) {
+	s := newSync(group("data", nil, "db"))
+	// The fake client doesn't manage metadata.generation, so the test sets it as the API server would.
+	s.Generation = 1
+	r := newTestReconciler(t, withApps([]client.Object{testProject(nil), s}, testApp("db"))...)
+	get := func() *syncv1alpha1.ApplicationSync {
+		t.Helper()
+		var got syncv1alpha1.ApplicationSync
+		require.NoError(t, r.Get(t.Context(), client.ObjectKeyFromObject(s), &got))
+		return &got
+	}
+	_, err := r.Reconcile(t.Context(), ctrlRequest(s))
+	require.NoError(t, err)
+	got := get()
+	assert.Equal(t, int64(1), got.Status.ObservedGeneration)
+
+	// A finished ApplicationSync still records that a later spec.paused edit was seen.
+	got.Status.Phase = syncv1alpha1.ApplicationSyncPhaseSucceeded
+	require.NoError(t, r.Status().Update(t.Context(), got))
+	got.Spec.Paused = true
+	got.Generation = 2
+	require.NoError(t, r.Update(t.Context(), got))
+	_, err = r.Reconcile(t.Context(), ctrlRequest(s))
+	require.NoError(t, err)
+	got = get()
+	assert.Equal(t, int64(2), got.Status.ObservedGeneration)
+	assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseSucceeded, got.Status.Phase)
+}
+
+func TestAllowEmpty(t *testing.T) {
+	prunable := argov1alpha1.ResourceStatus{Kind: "ConfigMap", Name: "old", Status: argov1alpha1.SyncStatusCodeOutOfSync, RequiresPruning: true}
+	kept := argov1alpha1.ResourceStatus{Kind: "ConfigMap", Name: "kept", Status: argov1alpha1.SyncStatusCodeSynced}
+	for _, tc := range []struct {
+		name       string
+		resources  []argov1alpha1.ResourceStatus
+		automated  bool
+		allowEmpty bool
+		want       syncv1alpha1.ApplicationSyncPhase
+	}{
+		{"automated run pruning everything", []argov1alpha1.ResourceStatus{prunable}, true, false, syncv1alpha1.ApplicationSyncPhaseFailed},
+		{"allowEmpty", []argov1alpha1.ResourceStatus{prunable}, true, true, syncv1alpha1.ApplicationSyncPhaseRunning},
+		{"manual run", []argov1alpha1.ResourceStatus{prunable}, false, false, syncv1alpha1.ApplicationSyncPhaseRunning},
+		{"a resource is kept", []argov1alpha1.ResourceStatus{prunable, kept}, true, false, syncv1alpha1.ApplicationSyncPhaseRunning},
+		// Auto-sync blocks this case, which stalls RollingSync on empty apps (argoproj/argo-cd#15371).
+		{"no resources", nil, true, false, syncv1alpha1.ApplicationSyncPhaseRunning},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app := testApp("db")
+			app.Status.Resources = tc.resources
+			r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, app)...)
+			s := newSync(group("data", nil, "db"))
+			if tc.automated {
+				ownByPolicy(s)
+			}
+			s.Spec.AllowEmpty = tc.allowEmpty
+
+			r.reconcileApplicationSync(t.Context(), s)
+			st := appStatus(t, s, "db")
+			assert.Equal(t, tc.want, st.Phase, st.Message)
+			if tc.want == syncv1alpha1.ApplicationSyncPhaseFailed {
+				assert.Contains(t, st.Message, "set allowEmpty")
+				assert.Nil(t, getTestApp(t, r.Client, "db").Operation, "no sync is started")
+			}
+		})
+	}
+}
+
+func TestRefusesAutoSyncedApp(t *testing.T) {
+	app := testApp("db")
+	app.Spec.SyncPolicy = &argov1alpha1.SyncPolicy{Automated: &argov1alpha1.SyncPolicyAutomated{SelfHeal: new(true)}}
+	r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, app)...)
+
+	s := newSync(group("data", nil, "db"))
+	r.reconcileApplicationSync(t.Context(), s)
+	st := appStatus(t, s, "db")
+	assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseFailed, st.Phase)
+	assert.Contains(t, st.Message, "auto-sync is enabled")
+	assert.Nil(t, getTestApp(t, r.Client, "db").Operation, "no sync is started")
+
+	// With onFailure: Wait, the app waits until auto-sync is turned off, here with automated.enabled: false.
+	s = newSync(group("data", nil, "db"))
+	s.Spec.OnFailure = syncv1alpha1.ApplicationSyncOnFailureWait
+	r.reconcileApplicationSync(t.Context(), s)
+	assert.Equal(t, syncv1alpha1.ApplicationSyncPhasePending, appStatus(t, s, "db").Phase)
+	updateTestApp(t, r.Client, "db", func(app *argov1alpha1.Application) { app.Spec.SyncPolicy.Automated.Enabled = new(false) })
+	r.reconcileApplicationSync(t.Context(), s)
+	assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseRunning, appStatus(t, s, "db").Phase)
 }
