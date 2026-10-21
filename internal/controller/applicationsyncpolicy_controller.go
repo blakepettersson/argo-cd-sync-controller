@@ -11,6 +11,7 @@ import (
 	argov1alpha1 "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -222,14 +223,39 @@ func leftOutOfSync(run *syncv1alpha1.ApplicationSync, apps map[string]*argov1alp
 	return ""
 }
 
+// cancelUnrecordedRuns deletes every unfinished run that names p as its controller but isn't its recorded run: one
+// left by a restart between creating a run and recording it, or a forgery. Naming p as controller hands it the run's
+// lifecycle, as garbage collection does when p is deleted, so no other run is touched, and p never has two runs
+// going. Operations a deleted run already started finish; nothing new starts.
+func (r *ApplicationSyncPolicyReconciler) cancelUnrecordedRuns(ctx context.Context, p *syncv1alpha1.ApplicationSyncPolicy) error {
+	var runs syncv1alpha1.ApplicationSyncList
+	if err := r.APIReader.List(ctx, &runs, client.InNamespace(p.Namespace)); err != nil {
+		return err
+	}
+	for i := range runs.Items {
+		run := &runs.Items[i]
+		if !metav1.IsControlledBy(run, p) || run.Status.Phase.Completed() || run.UID == p.Status.CurrentRunUID {
+			continue
+		}
+		if err := r.Delete(ctx, run, client.Preconditions{UID: &run.UID}); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("cancelling unrecorded run %s: %w", run.Name, err)
+		}
+	}
+	return nil
+}
+
 // createRun creates the next run and records the name and UID its create returned. It first bumps
 // status.runCount, so a stale cached policy fails on its outdated resourceVersion instead of starting a duplicate
-// run. If the controller stops before the run is recorded, the run is never adopted and the next pass starts
-// another; that duplicate is harmless, since both runs carry the same pins.
+// run. If the controller stops before the run is recorded, the run is never adopted: the next pass cancels it
+// before starting another.
 func (r *ApplicationSyncPolicyReconciler) createRun(ctx context.Context, p *syncv1alpha1.ApplicationSyncPolicy, change string, fill func(*syncv1alpha1.ApplicationSync)) (*syncv1alpha1.ApplicationSync, error) {
 	p.Status.RunCount++
 	if err := r.Status().Update(ctx, p); err != nil {
 		return nil, fmt.Errorf("recording the next run: %w", err)
+	}
+	// Only now that p's status is known to be current, or the status update above would have failed.
+	if err := r.cancelUnrecordedRuns(ctx, p); err != nil {
+		return nil, err
 	}
 	run := &syncv1alpha1.ApplicationSync{}
 	run.GenerateName = p.Name + "-"

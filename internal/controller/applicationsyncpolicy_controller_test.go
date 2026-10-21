@@ -318,6 +318,39 @@ func TestPolicyIgnoresForgedRuns(t *testing.T) {
 	assert.Contains(t, got.Status.Message, "started run")
 }
 
+// TestPolicyCancelsUnrecordedRuns covers a run the policy created but couldn't record before a restart, and a
+// forged one: both name the policy as controller, so both are cancelled before the policy starts its own run.
+func TestPolicyCancelsUnrecordedRuns(t *testing.T) {
+	db := testApp("db")
+	db.Status.Sync.Revision = "aaa111"
+	p := newTestPolicy(syncv1alpha1.ApplicationSyncConcurrencyForbid)
+	r := newTestPolicyReconciler(t, p, db, testApp("api"))
+	create := func(name string, owned bool, phase syncv1alpha1.ApplicationSyncPhase) {
+		run := newSync(group("data", nil, "db"))
+		run.Name, run.UID = name, ""
+		if owned {
+			require.NoError(t, controllerutil.SetControllerReference(p, run, r.Scheme()))
+		}
+		require.NoError(t, r.Create(t.Context(), run))
+		if phase != "" {
+			run.Status.Phase = phase
+			require.NoError(t, r.Status().Update(t.Context(), run))
+		}
+	}
+	create("orphan", true, syncv1alpha1.ApplicationSyncPhaseRunning)
+	create("forged", true, "")
+	create("orphan-done", true, syncv1alpha1.ApplicationSyncPhaseSucceeded)
+	create("unrelated", false, syncv1alpha1.ApplicationSyncPhaseRunning)
+
+	got := reconcilePolicy(t, r, p)
+	var names []string
+	for _, run := range listRuns(t, r) {
+		names = append(names, run.Name)
+	}
+	assert.ElementsMatch(t, []string{"orphan-done", "unrelated", got.Status.CurrentRun}, names,
+		"unfinished runs naming the policy as controller are cancelled; finished ones stay as history")
+}
+
 // TestPolicySelfHealSkipsAppsLeftOutOfSync covers doneWhen: Healthy, where a run can succeed with an app still
 // OutOfSync. That isn't drift, so self-healing it would start a new run on every backoff.
 func TestPolicySelfHealSkipsAppsLeftOutOfSync(t *testing.T) {
