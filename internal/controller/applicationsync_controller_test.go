@@ -16,9 +16,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/uuid"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	syncv1alpha1 "github.com/argoproj-labs/argo-cd-sync-controller/api/v1alpha1"
 )
@@ -78,6 +80,13 @@ func newTestReconciler(t *testing.T, objs ...client.Object) *ApplicationSyncReco
 		WithScheme(testScheme(t)).
 		WithObjects(objs...).
 		WithStatusSubresource(&syncv1alpha1.ApplicationSync{}, &syncv1alpha1.ApplicationSyncPolicy{}).
+		// The fake client doesn't assign UIDs, and policies identify their runs by the UID a create returns.
+		WithInterceptorFuncs(interceptor.Funcs{Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if obj.GetUID() == "" {
+				obj.SetUID(uuid.NewUUID())
+			}
+			return c.Create(ctx, obj, opts...)
+		}}).
 		Build()
 	return &ApplicationSyncReconciler{Client: c, APIReader: c, ArgoCDNamespace: testNamespace, HistoryLimit: 20}
 }

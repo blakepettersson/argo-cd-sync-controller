@@ -10,7 +10,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -277,33 +276,14 @@ func TestPolicyIgnoresStaleCurrentRun(t *testing.T) {
 	_, err := r.reconcilePolicy(t.Context(), p)
 	require.NoError(t, err)
 	require.Len(t, listRuns(t, r), 1)
-	assert.Equal(t, "platform-1", listRuns(t, r)[0].Name)
 
 	_, err = r.reconcilePolicy(t.Context(), stale)
-	require.True(t, apierrors.IsConflict(err), "recording the next run fails on the stale resourceVersion: %v", err)
+	require.True(t, apierrors.IsConflict(err), "bumping runCount fails on the stale resourceVersion: %v", err)
 	require.Len(t, listRuns(t, r), 1)
 }
 
-// TestPolicyAdoptsRunWhoseUIDWasNotRecorded covers the controller stopping between creating a run and recording its
-// UID.
-func TestPolicyAdoptsRunWhoseUIDWasNotRecorded(t *testing.T) {
-	db := testApp("db")
-	db.Status.Sync.Revision = "aaa111"
-	p := newTestPolicy("")
-	r := newTestPolicyReconciler(t, p, db, testApp("api"))
-	got := reconcilePolicy(t, r, p)
-	run := getRun(t, r, got.Status.CurrentRun)
-
-	got.Status.CurrentRunUID = ""
-	require.NoError(t, r.Status().Update(t.Context(), got))
-	got = reconcilePolicy(t, r, got)
-	require.Len(t, listRuns(t, r), 1)
-	assert.Equal(t, run.UID, got.Status.CurrentRunUID)
-	assert.Contains(t, got.Status.Message, "is in progress")
-}
-
-// TestPolicyIgnoresForgedRuns covers an ApplicationSync made to look like the policy's run: its label, owner
-// reference and name can all be copied, but it isn't recorded in the policy's status.
+// TestPolicyIgnoresForgedRuns covers ApplicationSyncs made to look like the policy's run. Their label, owner
+// reference and name can all be copied, and even a name in the policy's status isn't enough without its UID.
 func TestPolicyIgnoresForgedRuns(t *testing.T) {
 	db := testApp("db")
 	db.Status.Sync.Revision = "aaa111"
@@ -311,26 +291,31 @@ func TestPolicyIgnoresForgedRuns(t *testing.T) {
 	r := newTestPolicyReconciler(t, p, db, testApp("api"))
 	forge := func(name string) {
 		run := newSync(group("data", nil, "db"))
-		run.Name, run.UID = name, types.UID(name+"-uid")
+		run.Name, run.UID = name, ""
 		run.Labels = map[string]string{PolicyLabel: p.Name}
 		run.Spec.Paused = true
 		require.NoError(t, controllerutil.SetControllerReference(p, run, r.Scheme()))
 		require.NoError(t, r.Create(t.Context(), run))
 	}
-	forge("platform-99")
-	forge("platform-1") // the name the policy would pick first
+	forge("platform-forged")
+	forge("platform-recorded")
+	// As if the policy had recorded this name but not yet the UID its create returned.
+	p.Status.CurrentRun = "platform-recorded"
+	require.NoError(t, r.Status().Update(t.Context(), p))
 
 	got := reconcilePolicy(t, r, p)
-	assert.Equal(t, "platform-2", got.Status.CurrentRun, "a taken name is skipped, not adopted")
-	assert.Contains(t, got.Status.Message, "started run platform-2")
+	require.NotContains(t, []string{"platform-forged", "platform-recorded"}, got.Status.CurrentRun)
+	own := getRun(t, r, got.Status.CurrentRun)
+	assert.Equal(t, own.UID, got.Status.CurrentRunUID)
+	assert.Contains(t, got.Status.Message, "started run "+own.Name)
 
 	// The paused forgeries don't hold up a Forbid policy: once its own run is done, the next change starts.
-	run := getRun(t, r, "platform-2")
-	run.Status.Phase = syncv1alpha1.ApplicationSyncPhaseSucceeded
-	require.NoError(t, r.Status().Update(t.Context(), &run))
+	own.Status.Phase = syncv1alpha1.ApplicationSyncPhaseSucceeded
+	require.NoError(t, r.Status().Update(t.Context(), &own))
 	updateTestApp(t, r.Client, "db", func(app *argov1alpha1.Application) { app.Status.Sync.Revision = "bbb222" })
 	got = reconcilePolicy(t, r, got)
-	assert.Equal(t, "platform-3", got.Status.CurrentRun)
+	assert.NotEqual(t, own.Name, got.Status.CurrentRun)
+	assert.Contains(t, got.Status.Message, "started run")
 }
 
 // TestPolicySelfHealSkipsAppsLeftOutOfSync covers doneWhen: Healthy, where a run can succeed with an app still

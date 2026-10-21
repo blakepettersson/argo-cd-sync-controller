@@ -254,15 +254,17 @@ const (
 
 // ApplicationSyncPolicyStatus is the observed state of an ApplicationSyncPolicy
 type ApplicationSyncPolicyStatus struct {
-	// CurrentRun is the name of the ApplicationSync the policy created last. It is recorded before the run is
-	// created, so a run is never left unrecorded.
+	// CurrentRun is the name of the ApplicationSync the policy created last, as its create returned it
 	CurrentRun string `json:"currentRun,omitempty"`
-	// CurrentRunUID is CurrentRun's UID, recorded once it is created. Only the controller writes status, so this,
-	// not a run's labels or owner references, is what identifies the policy's run.
+	// CurrentRunUID is CurrentRun's UID. Only the controller writes status, so this, not a run's labels or owner
+	// references, is what identifies the policy's run.
 	CurrentRunUID types.UID `json:"currentRunUID,omitempty"`
 	// CurrentRunChange is the change CurrentRun rolls out, so the policy starts no second run for it.
 	CurrentRunChange string `json:"currentRunChange,omitempty"`
-	Message          string `json:"message,omitempty"`
+	// RunCount counts the runs the policy has started. It is written before each create, so a stale cached policy
+	// fails on its outdated resourceVersion instead of starting a duplicate run.
+	RunCount int64  `json:"runCount,omitempty"`
+	Message  string `json:"message,omitempty"`
 	// SelfHealAttempts counts the self-heal runs started for the current change
 	SelfHealAttempts int64 `json:"selfHealAttempts,omitempty"`
 	// ObservedGeneration is the metadata.generation this status was computed for
