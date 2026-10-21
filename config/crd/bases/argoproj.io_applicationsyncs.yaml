@@ -197,11 +197,12 @@ spec:
                         A percentage that rounds down to 0 becomes 1, except 0%. 0 or 0% pauses the group.
                       x-kubernetes-int-or-string: true
                     name:
-                      description: Name of the group, unique within the ApplicationSync
+                      default: default
+                      description: |-
+                        Name of the group, unique within the ApplicationSync. Defaults to "default", so it can be left out when there
+                        is only one group; two unnamed groups are rejected as duplicates.
                       minLength: 1
                       type: string
-                  required:
-                  - name
                   type: object
                 minItems: 1
                 type: array

@@ -85,9 +85,11 @@ const (
 
 // ApplicationSyncGroup is a set of Applications synced in parallel, after the groups it depends on.
 type ApplicationSyncGroup struct {
-	// Name of the group, unique within the ApplicationSync
+	// Name of the group, unique within the ApplicationSync. Defaults to "default", so it can be left out when there
+	// is only one group; two unnamed groups are rejected as duplicates.
+	// +kubebuilder:default=default
 	// +kubebuilder:validation:MinLength=1
-	Name string `json:"name"`
+	Name string `json:"name,omitempty"`
 	// DependsOn names other groups whose apps must all be synced and Healthy before this group starts
 	// +listType=set
 	DependsOn []string `json:"dependsOn,omitempty"`

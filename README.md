@@ -45,8 +45,9 @@ kubectl apply -f release-42.yaml
 kubectl get appsync release-42 -o wide
 ```
 
-A single app is a single group with one entry. Status is reported per group and per app under
-`status.groups`.
+A single app is a single group with one entry. A group's `name` defaults to `default`, so it can be left out
+when there is only one group (`groups: [{apps: [{name: guestbook}]}]`). Status is reported per group and per app
+under `status.groups`.
 
 ## Behavior
 
