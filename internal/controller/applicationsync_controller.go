@@ -31,6 +31,13 @@ const (
 	appIndex = "spec.groups.apps.name"
 	// resyncPeriod is a safety net; app changes wake an ApplicationSync straight away.
 	resyncPeriod = 30 * time.Second
+	// waitingForAppMessage is the wait that only ends if someone creates the app, so its event is a warning.
+	waitingForAppMessage = "waiting for application to exist"
+	// Routine waits, which recordWaits doesn't report: they are expected, and would emit an event per app.
+	waitingForSlotPrefix     = "waiting for one of "
+	waitingForRefreshMessage = "waiting for application to be refreshed"
+	// waitingToRecoverSuffix ends the message of an app that failed under onFailure: Wait.
+	waitingToRecoverSuffix = "; waiting for the application to recover"
 )
 
 // ApplicationSyncReconciler runs ApplicationSyncs: it sets each app's operation in group order and reads the
@@ -92,7 +99,7 @@ func (r *ApplicationSyncReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	orig := s.Status.DeepCopy()
-	// Nothing changes once finished, but a later spec.paused edit is still recorded as observed.
+	// Nothing changes once finished, but a later TTL edit is still recorded as observed.
 	if !orig.Phase.Completed() {
 		r.reconcileApplicationSync(ctx, &s)
 	}
@@ -101,14 +108,52 @@ func (r *ApplicationSyncReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		if err := r.Status().Update(ctx, &s); err != nil {
 			return ctrl.Result{}, err
 		}
+		r.recordWaits(orig, &s)
 	}
 	if s.Status.Phase.Completed() {
 		if !orig.Phase.Completed() {
 			r.gc(ctx, &s)
 		}
-		return ctrl.Result{}, nil
+		return r.expire(ctx, &s)
 	}
-	return ctrl.Result{RequeueAfter: resyncPeriod}, nil
+	requeue := resyncPeriod
+	if d := s.Spec.ActiveDeadlineSeconds; d != nil && s.Status.StartedAt != nil {
+		requeue = max(min(requeue, time.Until(s.Status.StartedAt.Add(time.Duration(*d)*time.Second))), time.Second)
+	}
+	return ctrl.Result{RequeueAfter: requeue}, nil
+}
+
+// recordWaits emits an event when an app starts waiting, or waits for a different reason, so kubectl describe and
+// event-based alerting show what a run is blocked on.
+func (r *ApplicationSyncReconciler) recordWaits(orig *syncv1alpha1.ApplicationSyncStatus, s *syncv1alpha1.ApplicationSync) {
+	if r.Recorder == nil {
+		return
+	}
+	before := map[string]string{}
+	for _, g := range orig.Groups {
+		for _, st := range g.Apps {
+			before[st.Name] = st.Message
+		}
+	}
+	for _, g := range s.Status.Groups {
+		for _, st := range g.Apps {
+			waiting := st.Phase == syncv1alpha1.ApplicationSyncPhasePending || strings.HasSuffix(st.Message, waitingToRecoverSuffix)
+			// A recovery wait's message changes with every retry; report it once, when the app starts waiting.
+			recovering := strings.HasSuffix(st.Message, waitingToRecoverSuffix) && strings.HasSuffix(before[st.Name], waitingToRecoverSuffix)
+			if !waiting || recovering || st.Message == "" || st.Message == before[st.Name] {
+				continue
+			}
+			if st.Message == waitingForRefreshMessage ||
+				strings.HasPrefix(st.Message, waitingForSlotPrefix) {
+				continue
+			}
+			eventType := corev1.EventTypeNormal
+			if st.Message == waitingForAppMessage {
+				eventType = corev1.EventTypeWarning
+			}
+			r.Recorder.Eventf(s, nil, eventType, "ApplicationWaiting", "Wait", "application %s: %s", st.Name, st.Message)
+		}
+	}
 }
 
 // reconcileApplicationSync advances s.Status.
@@ -132,9 +177,6 @@ func (r *ApplicationSyncReconciler) reconcileApplicationSync(ctx context.Context
 		}
 	}
 	s.Status.Message = ""
-	if s.Spec.Paused {
-		s.Status.Message = "paused"
-	}
 
 	statuses := make(map[string]*syncv1alpha1.ApplicationSyncGroupStatus, len(s.Status.Groups))
 	for i := range s.Status.Groups {
@@ -146,12 +188,37 @@ func (r *ApplicationSyncReconciler) reconcileApplicationSync(ctx context.Context
 		}
 	}
 	for _, i := range order {
-		r.reconcileGroup(ctx, s, s.Spec.Groups[i], statuses)
+		r.reconcileGroup(ctx, s, s.Spec.Groups[i], statuses, now.Time)
 	}
-
 	failed, total := 0, 0
 	for _, gs := range s.Status.Groups {
 		if !gs.Phase.Completed() {
+			// Checked after the groups, so an app that finished in this pass keeps its result.
+			if deadlinePassed(s, now.Time) {
+				msg := fmt.Sprintf("exceeded activeDeadlineSeconds (%ds)", *s.Spec.ActiveDeadlineSeconds)
+				for gi := range s.Status.Groups {
+					g := &s.Status.Groups[gi]
+					if g.Phase.Completed() {
+						continue
+					}
+					// A group that never started is Skipped, as when a group it depends on fails.
+					phase := syncv1alpha1.ApplicationSyncPhaseFailed
+					if g.Phase == syncv1alpha1.ApplicationSyncPhasePending {
+						phase = syncv1alpha1.ApplicationSyncPhaseSkipped
+					}
+					g.Phase, g.Message = phase, msg
+					for ai := range g.Apps {
+						if !g.Apps[ai].Phase.Completed() {
+							g.Apps[ai].Phase, g.Apps[ai].Message = phase, msg
+						}
+					}
+				}
+				s.Status.Phase = syncv1alpha1.ApplicationSyncPhaseFailed
+				s.Status.Message = msg
+				s.Status.FinishedAt = &now
+				return
+			}
+			setWaitMessage(s)
 			return
 		}
 		for _, st := range gs.Apps {
@@ -171,7 +238,36 @@ func (r *ApplicationSyncReconciler) reconcileApplicationSync(ctx context.Context
 	s.Status.Message = ""
 }
 
-func (r *ApplicationSyncReconciler) reconcileGroup(ctx context.Context, s *syncv1alpha1.ApplicationSync, spec syncv1alpha1.ApplicationSyncGroup, statuses map[string]*syncv1alpha1.ApplicationSyncGroupStatus) {
+func deadlinePassed(s *syncv1alpha1.ApplicationSync, now time.Time) bool {
+	d := s.Spec.ActiveDeadlineSeconds
+	return d != nil && s.Status.StartedAt != nil && !now.Before(s.Status.StartedAt.Add(time.Duration(*d)*time.Second))
+}
+
+// setWaitMessage surfaces, in the run's own message, the first app in a running group that is waiting to sync or to
+// recover, so kubectl get shows what a run is blocked on.
+func setWaitMessage(s *syncv1alpha1.ApplicationSync) {
+	if s.Status.Message != "" {
+		return
+	}
+	// A routine wait (a refresh, a free slot) is only shown when nothing else is waiting.
+	for _, routine := range []bool{false, true} {
+		for _, gs := range s.Status.Groups {
+			if gs.Phase != syncv1alpha1.ApplicationSyncPhaseRunning {
+				continue
+			}
+			for _, st := range gs.Apps {
+				waiting := st.Phase == syncv1alpha1.ApplicationSyncPhasePending && st.Message != "" || strings.HasSuffix(st.Message, waitingToRecoverSuffix)
+				isRoutine := st.Message == waitingForRefreshMessage || strings.HasPrefix(st.Message, waitingForSlotPrefix)
+				if waiting && isRoutine == routine {
+					s.Status.Message = fmt.Sprintf("application %s: %s", st.Name, st.Message)
+					return
+				}
+			}
+		}
+	}
+}
+
+func (r *ApplicationSyncReconciler) reconcileGroup(ctx context.Context, s *syncv1alpha1.ApplicationSync, spec syncv1alpha1.ApplicationSyncGroup, statuses map[string]*syncv1alpha1.ApplicationSyncGroupStatus, now time.Time) {
 	gs := statuses[spec.Name]
 	if gs.Phase == syncv1alpha1.ApplicationSyncPhasePending {
 		for _, dep := range spec.DependsOn {
@@ -189,6 +285,10 @@ func (r *ApplicationSyncReconciler) reconcileGroup(ctx context.Context, s *syncv
 				gs.Message = fmt.Sprintf("waiting for group %q", dep)
 				return
 			}
+		}
+		if deadlinePassed(s, now) {
+			// Left Pending, so the deadline marks it Skipped: it never started.
+			return
 		}
 		gs.Phase = syncv1alpha1.ApplicationSyncPhaseRunning
 		gs.Message = ""
@@ -212,7 +312,7 @@ func (r *ApplicationSyncReconciler) reconcileGroup(ctx context.Context, s *syncv
 			inFlight++
 		}
 	}
-	limit, paused := groupLimit(spec.MaxParallel, len(spec.Apps))
+	limit := groupLimit(spec.MaxParallel, len(spec.Apps))
 	gs.Message = ""
 	for i := range gs.Apps {
 		st := &gs.Apps[i]
@@ -220,15 +320,11 @@ func (r *ApplicationSyncReconciler) reconcileGroup(ctx context.Context, s *syncv
 			continue
 		}
 		switch {
-		case s.Spec.Paused:
-			st.Message = "paused"
-			continue
-		case paused:
-			st.Message = "paused by maxParallel"
-			gs.Message = st.Message
+		case deadlinePassed(s, now):
+			// The deadline check after the groups fails it; start nothing new.
 			continue
 		case limit >= 0 && inFlight >= limit:
-			st.Message = fmt.Sprintf("waiting for one of %d parallel slots", limit)
+			st.Message = fmt.Sprintf(waitingForSlotPrefix+"%d parallel slots", limit)
 			continue
 		}
 		r.reconcileApp(ctx, s, apps[st.Name], st)
@@ -266,20 +362,17 @@ func inFlightPhase(p syncv1alpha1.ApplicationSyncPhase) bool {
 	return p == syncv1alpha1.ApplicationSyncPhaseRunning || p == syncv1alpha1.ApplicationSyncPhaseProgressing
 }
 
-// groupLimit returns how many apps of a group may be in flight at once (-1 for no limit), and whether
-// maxParallel pauses the group. It rounds like RollingSync's maxUpdate.
-func groupLimit(maxParallel *intstr.IntOrString, total int) (int, bool) {
+// groupLimit returns how many apps of a group may be in flight at once, or -1 for no limit. It rounds like
+// RollingSync's maxUpdate, except that it never returns 0: the CRD rejects 0, and a percentage rounds up to 1.
+func groupLimit(maxParallel *intstr.IntOrString, total int) int {
 	if maxParallel == nil {
-		return -1, false
+		return -1
 	}
 	limit, err := intstr.GetScaledValueFromIntOrPercent(maxParallel, total, false)
 	if err != nil {
-		return -1, false
+		return -1
 	}
-	if maxParallel.Type == intstr.String && maxParallel.StrVal != "0%" && limit < 1 {
-		limit = 1
-	}
-	return limit, limit == 0
+	return max(limit, 1)
 }
 
 func (r *ApplicationSyncReconciler) reconcileApp(ctx context.Context, s *syncv1alpha1.ApplicationSync, spec syncv1alpha1.ApplicationSyncApp, st *syncv1alpha1.ApplicationSyncAppStatus) {
@@ -287,7 +380,7 @@ func (r *ApplicationSyncReconciler) reconcileApp(ctx context.Context, s *syncv1a
 	// fail ends the app in Fail mode. In Wait mode the app keeps waiting for a retry or a manual fix.
 	fail := func(msg string) {
 		if wait {
-			st.Message = msg + "; waiting for the application to recover"
+			st.Message = msg + waitingToRecoverSuffix
 			return
 		}
 		st.Phase = syncv1alpha1.ApplicationSyncPhaseFailed
@@ -299,7 +392,7 @@ func (r *ApplicationSyncReconciler) reconcileApp(ctx context.Context, s *syncv1a
 	case syncv1alpha1.ApplicationSyncPhasePending:
 		app, err := argo.getApp(ctx, s.Namespace, st.Name)
 		if err != nil {
-			st.Message = "waiting for application to exist"
+			st.Message = waitingForAppMessage
 			return
 		}
 		if len(spec.Revisions) > 0 && st.PinnedRevisions == nil {
@@ -310,6 +403,7 @@ func (r *ApplicationSyncReconciler) reconcileApp(ctx context.Context, s *syncv1a
 		if isOperationFor(s, app.Operation) || operationStateFor(s, app) != nil {
 			st.Phase = syncv1alpha1.ApplicationSyncPhaseRunning
 			st.Message = ""
+			st.UID = app.UID
 			return
 		}
 		// Argo CD's auto-sync and self-heal would otherwise sync the app too, ahead of its group or away from a pin.
@@ -331,19 +425,20 @@ func (r *ApplicationSyncReconciler) reconcileApp(ctx context.Context, s *syncv1a
 		}
 		if s.Spec.SkipIfSynced {
 			if !r.isFresh(ctx, app, s.Status.StartedAt) {
-				st.Message = "waiting for application to be refreshed"
+				st.Message = waitingForRefreshMessage
 				return
 			}
 			if app.Status.Sync.Status == argov1alpha1.SyncStatusCodeSynced && revisionsMatch(st.PinnedRevisions, app.Status.GetRevisions()) {
 				st.Phase = syncv1alpha1.ApplicationSyncPhaseProgressing
 				st.Revisions = app.Status.GetRevisions()
 				st.Message = "already synced"
+				st.UID = app.UID
 				return
 			}
 		}
 		if checksEmpty(s, spec) {
 			if !r.isFresh(ctx, app, s.Status.StartedAt) {
-				st.Message = "waiting for application to be refreshed"
+				st.Message = waitingForRefreshMessage
 				return
 			}
 			if prunesEverything(app) {
@@ -353,6 +448,11 @@ func (r *ApplicationSyncReconciler) reconcileApp(ctx context.Context, s *syncv1a
 		}
 		err = r.startOperation(ctx, s, spec, st, app)
 		if errors.Is(err, errApplicationSyncGone) {
+			return
+		}
+		if errors.Is(err, errApplicationReplaced) {
+			// The cache hasn't caught up with a recreated app; check the new one on a later pass.
+			st.Message = "waiting for the cache to catch up with a recreated application"
 			return
 		}
 		if errors.Is(err, errAnotherOperationInProgress) {
@@ -365,21 +465,24 @@ func (r *ApplicationSyncReconciler) reconcileApp(ctx context.Context, s *syncv1a
 		}
 		st.Phase = syncv1alpha1.ApplicationSyncPhaseRunning
 		st.Message = ""
+		st.UID = app.UID
 
 	case syncv1alpha1.ApplicationSyncPhaseRunning:
 		app, err := argo.getApp(ctx, s.Namespace, st.Name)
-		if err != nil {
+		// An app deleted, or replaced by a same-named one, after its sync started never recovers, so it fails even
+		// with onFailure: Wait.
+		if err != nil || st.UID != "" && app.UID != st.UID {
 			st.Phase = syncv1alpha1.ApplicationSyncPhaseFailed
-			st.Message = "application was deleted"
+			st.Message = "application was deleted or recreated"
 			return
 		}
 		state := operationStateFor(s, app)
 		if state == nil && !isOperationFor(s, app.Operation) {
 			// The cache may not have caught up with the operation this controller just set.
 			live, err := argo.getLiveApp(ctx, app.Namespace, app.Name)
-			if apierrors.IsNotFound(err) {
+			if apierrors.IsNotFound(err) || err == nil && st.UID != "" && live.UID != st.UID {
 				st.Phase = syncv1alpha1.ApplicationSyncPhaseFailed
-				st.Message = "application was deleted"
+				st.Message = "application was deleted or recreated"
 				return
 			}
 			if err != nil {
@@ -430,9 +533,9 @@ func (r *ApplicationSyncReconciler) reconcileApp(ctx context.Context, s *syncv1a
 
 	case syncv1alpha1.ApplicationSyncPhaseProgressing:
 		app, err := argo.getApp(ctx, s.Namespace, st.Name)
-		if err != nil {
+		if err != nil || st.UID != "" && app.UID != st.UID {
 			st.Phase = syncv1alpha1.ApplicationSyncPhaseFailed
-			st.Message = "application was deleted"
+			st.Message = "application was deleted or recreated"
 			return
 		}
 		since := st.FinishedAt
@@ -440,7 +543,7 @@ func (r *ApplicationSyncReconciler) reconcileApp(ctx context.Context, s *syncv1a
 			since = s.Status.StartedAt
 		}
 		if !r.isFresh(ctx, app, since) {
-			st.Message = "waiting for application to be refreshed"
+			st.Message = waitingForRefreshMessage
 			return
 		}
 		switch app.Status.Health.Status {
@@ -606,7 +709,7 @@ func (r *ApplicationSyncReconciler) startOperation(ctx context.Context, s *syncv
 	if live.UID != s.UID || live.DeletionTimestamp != nil {
 		return errApplicationSyncGone
 	}
-	if err := argo.setOperation(ctx, app.Namespace, app.Name, &op); err != nil {
+	if err := argo.setOperation(ctx, app.Namespace, app.Name, app.UID, &op); err != nil {
 		return err
 	}
 	if r.Recorder != nil {

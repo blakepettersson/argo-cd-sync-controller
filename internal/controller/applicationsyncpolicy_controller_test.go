@@ -240,6 +240,22 @@ func TestPolicySelfHealBackoff(t *testing.T) {
 	assert.Equal(t, int64(1), got.Status.SelfHealAttempts)
 }
 
+func TestPolicySuspend(t *testing.T) {
+	p := newTestPolicy("")
+	p.Spec.Suspend = true
+	r := newTestPolicyReconciler(t, p, testApp("db"), testApp("api"))
+
+	got := reconcilePolicy(t, r, p)
+	assert.Empty(t, listRuns(t, r), "a suspended policy starts no run, even with drift")
+	assert.Equal(t, "suspended", got.Status.Message)
+
+	got.Spec.Suspend = false
+	require.NoError(t, r.Update(t.Context(), got))
+	got = reconcilePolicy(t, r, got)
+	assert.Len(t, listRuns(t, r), 1, "resuming starts the change that arrived meanwhile")
+	assert.Contains(t, got.Status.Message, "started run")
+}
+
 func TestPolicyNoSelfHeal(t *testing.T) {
 	db := testApp("db")
 	db.Status.Sync.Revision = "aaa111"
@@ -293,7 +309,6 @@ func TestPolicyIgnoresForgedRuns(t *testing.T) {
 		run := newSync(group("data", nil, "db"))
 		run.Name, run.UID = name, ""
 		run.Labels = map[string]string{PolicyLabel: p.Name}
-		run.Spec.Paused = true
 		require.NoError(t, controllerutil.SetControllerReference(p, run, r.Scheme()))
 		require.NoError(t, r.Create(t.Context(), run))
 	}
@@ -309,7 +324,7 @@ func TestPolicyIgnoresForgedRuns(t *testing.T) {
 	assert.Equal(t, own.UID, got.Status.CurrentRunUID)
 	assert.Contains(t, got.Status.Message, "started run "+own.Name)
 
-	// The paused forgeries don't hold up a Forbid policy: once its own run is done, the next change starts.
+	// The unfinished forgeries don't hold up a Forbid policy: once its own run is done, the next change starts.
 	own.Status.Phase = syncv1alpha1.ApplicationSyncPhaseSucceeded
 	require.NoError(t, r.Status().Update(t.Context(), &own))
 	updateTestApp(t, r.Client, "db", func(app *argov1alpha1.Application) { app.Status.Sync.Revision = "bbb222" })
@@ -355,34 +370,72 @@ func TestPolicyCancelsUnrecordedRuns(t *testing.T) {
 // OutOfSync. That isn't drift, so self-healing it would start a new run on every backoff.
 func TestPolicySelfHealSkipsAppsLeftOutOfSync(t *testing.T) {
 	for _, tc := range []struct {
+		name      string
 		endedWith argov1alpha1.SyncStatusCode
-		runs      int
+		apiDrifts bool
+		healed    []string // apps in the self-heal run; nil means no run
 	}{
-		{argov1alpha1.SyncStatusCodeOutOfSync, 1},
-		{argov1alpha1.SyncStatusCodeSynced, 2},
+		{"left OutOfSync, nothing else drifted", argov1alpha1.SyncStatusCodeOutOfSync, false, nil},
+		{"left OutOfSync, another app drifted", argov1alpha1.SyncStatusCodeOutOfSync, true, []string{"api"}},
+		{"ended Synced and drifted", argov1alpha1.SyncStatusCodeSynced, false, []string{"db", "api"}},
 	} {
-		t.Run(string(tc.endedWith), func(t *testing.T) {
-			db := testApp("db")
+		t.Run(tc.name, func(t *testing.T) {
+			db, api := testApp("db"), testApp("api")
 			db.Status.Sync.Revision = "aaa111"
+			api.Status.Sync.Status = argov1alpha1.SyncStatusCodeSynced
+			api.Status.Sync.Revision = "aaa111"
 			p := newTestPolicy("")
 			p.Spec.SelfHeal = true
-			r := newTestPolicyReconciler(t, p, db, testApp("api"))
+			r := newTestPolicyReconciler(t, p, db, api)
 
 			got := reconcilePolicy(t, r, p)
 			var run syncv1alpha1.ApplicationSync
 			require.NoError(t, r.Get(t.Context(), client.ObjectKey{Namespace: testNamespace, Name: got.Status.CurrentRun}, &run))
 			run.Status.Phase = syncv1alpha1.ApplicationSyncPhaseSucceeded
 			run.Status.FinishedAt = new(metav1.Now())
-			run.Status.Groups = []syncv1alpha1.ApplicationSyncGroupStatus{{Name: "data", Phase: syncv1alpha1.ApplicationSyncPhaseSucceeded, Apps: []syncv1alpha1.ApplicationSyncAppStatus{
-				{Name: "db", Phase: syncv1alpha1.ApplicationSyncPhaseSucceeded, SyncStatus: tc.endedWith},
-			}}}
+			run.Status.Groups = []syncv1alpha1.ApplicationSyncGroupStatus{
+				{Name: "data", Phase: syncv1alpha1.ApplicationSyncPhaseSucceeded, Apps: []syncv1alpha1.ApplicationSyncAppStatus{
+					{Name: "db", Phase: syncv1alpha1.ApplicationSyncPhaseSucceeded, SyncStatus: tc.endedWith},
+				}},
+				{Name: "backend", Phase: syncv1alpha1.ApplicationSyncPhaseSucceeded, Apps: []syncv1alpha1.ApplicationSyncAppStatus{
+					{Name: "api", Phase: syncv1alpha1.ApplicationSyncPhaseSucceeded, SyncStatus: argov1alpha1.SyncStatusCodeSynced},
+				}},
+			}
 			require.NoError(t, r.Status().Update(t.Context(), &run))
+			if tc.apiDrifts {
+				updateTestApp(t, r.Client, "api", func(app *argov1alpha1.Application) { app.Status.Sync.Status = argov1alpha1.SyncStatusCodeOutOfSync })
+			}
 
 			got = reconcilePolicy(t, r, got)
-			assert.Len(t, listRuns(t, r), tc.runs)
-			if tc.runs == 1 {
-				assert.Contains(t, got.Status.Message, `left application "db" OutOfSync`)
+			if tc.healed == nil {
+				assert.Len(t, listRuns(t, r), 1)
+				assert.Contains(t, got.Status.Message, "left db OutOfSync; nothing else drifted")
+				return
 			}
+			require.Len(t, listRuns(t, r), 2)
+			var healed []string
+			for _, g := range getRun(t, r, got.Status.CurrentRun).Spec.Groups {
+				for _, a := range g.Apps {
+					healed = append(healed, a.Name)
+				}
+			}
+			assert.Equal(t, tc.healed, healed)
+			if !tc.apiDrifts {
+				return
+			}
+
+			// The heal run left db out, so it has no entry for db; db must still count as left OutOfSync.
+			heal := getRun(t, r, got.Status.CurrentRun)
+			heal.Status.Phase = syncv1alpha1.ApplicationSyncPhaseSucceeded
+			heal.Status.FinishedAt = new(metav1.Now())
+			heal.Status.Groups = []syncv1alpha1.ApplicationSyncGroupStatus{{Name: "backend", Phase: syncv1alpha1.ApplicationSyncPhaseSucceeded, Apps: []syncv1alpha1.ApplicationSyncAppStatus{
+				{Name: "api", Phase: syncv1alpha1.ApplicationSyncPhaseSucceeded, SyncStatus: argov1alpha1.SyncStatusCodeSynced},
+			}}}
+			require.NoError(t, r.Status().Update(t.Context(), &heal))
+			updateTestApp(t, r.Client, "api", func(app *argov1alpha1.Application) { app.Status.Sync.Status = argov1alpha1.SyncStatusCodeSynced })
+			got = reconcilePolicy(t, r, got)
+			assert.Len(t, listRuns(t, r), 2, "db isn't self-healed on the next round either")
+			assert.Contains(t, got.Status.Message, "left db OutOfSync; nothing else drifted")
 		})
 	}
 }

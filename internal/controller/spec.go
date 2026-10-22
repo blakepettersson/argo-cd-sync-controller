@@ -11,6 +11,8 @@ import (
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/utils/text"
 	argov1alpha1 "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -220,12 +222,19 @@ func (r *ApplicationSyncReconciler) gc(ctx context.Context, s *syncv1alpha1.Appl
 		if !ti.Equal(tj) {
 			return ti.After(tj)
 		}
+		// finishedAt has second precision; fall back to creation order, then name.
+		ci, cj := completed[i].CreationTimestamp, completed[j].CreationTimestamp
+		if !ci.Equal(&cj) {
+			return cj.Before(&ci)
+		}
 		return completed[i].Name > completed[j].Name
 	})
 	newer := map[string]int{} // completed runs seen so far, newest first, per app
 	for _, c := range completed {
-		keep := false
-		for _, name := range slices.Compact(slices.Sorted(slices.Values(appNames(c.Spec)))) {
+		names := slices.Compact(slices.Sorted(slices.Values(appNames(c.Spec))))
+		// A run that lists no apps counts toward no app's history; only its TTL deletes it.
+		keep := len(names) == 0
+		for _, name := range names {
 			if newer[name] < r.HistoryLimit {
 				keep = true
 			}
@@ -234,11 +243,53 @@ func (r *ApplicationSyncReconciler) gc(ctx context.Context, s *syncv1alpha1.Appl
 		if keep {
 			continue
 		}
-		err := r.Delete(ctx, c, client.Preconditions{UID: &c.UID})
+		current, err := r.isPolicyCurrentRun(ctx, c)
+		if err != nil {
+			log.FromContext(ctx).Error(err, "checking whether a policy still needs its run", "applicationsync", c.Name)
+		}
+		if current || err != nil {
+			continue
+		}
+		err = r.Delete(ctx, c, client.Preconditions{UID: &c.UID})
 		if err != nil && !apierrors.IsNotFound(err) {
 			log.FromContext(ctx).Error(err, "garbage collecting ApplicationSync", "applicationsync", c.Name)
 		}
 	}
+}
+
+// expire deletes s once ttlSecondsAfterFinished has passed, and otherwise requeues it for then. A policy's latest
+// run is kept whatever its TTL.
+func (r *ApplicationSyncReconciler) expire(ctx context.Context, s *syncv1alpha1.ApplicationSync) (ctrl.Result, error) {
+	if s.Spec.TTLSecondsAfterFinished == nil || s.Status.FinishedAt == nil {
+		return ctrl.Result{}, nil
+	}
+	if remaining := time.Until(s.Status.FinishedAt.Add(time.Duration(*s.Spec.TTLSecondsAfterFinished) * time.Second)); remaining > 0 {
+		return ctrl.Result{RequeueAfter: remaining}, nil
+	}
+	current, err := r.isPolicyCurrentRun(ctx, s)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if current {
+		return ctrl.Result{RequeueAfter: resyncPeriod}, nil
+	}
+	err = r.Delete(ctx, s, client.Preconditions{UID: &s.UID})
+	return ctrl.Result{}, client.IgnoreNotFound(err)
+}
+
+// isPolicyCurrentRun reports whether s is the latest run of the policy that owns it, which neither the history
+// limit nor a TTL deletes, because the policy's same-change and self-heal checks read it.
+func (r *ApplicationSyncReconciler) isPolicyCurrentRun(ctx context.Context, s *syncv1alpha1.ApplicationSync) (bool, error) {
+	owner := metav1.GetControllerOf(s)
+	if owner == nil || owner.Kind != "ApplicationSyncPolicy" || owner.APIVersion != syncv1alpha1.GroupVersion.String() {
+		return false, nil
+	}
+	var p syncv1alpha1.ApplicationSyncPolicy
+	err := r.Get(ctx, client.ObjectKey{Namespace: s.Namespace, Name: owner.Name}, &p)
+	if err != nil {
+		return false, client.IgnoreNotFound(err)
+	}
+	return p.UID == owner.UID && p.Status.CurrentRunUID == s.UID, nil
 }
 
 func finishedAt(s *syncv1alpha1.ApplicationSync) time.Time {

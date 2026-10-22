@@ -57,7 +57,11 @@ under `status.groups`.
   synced, and a policy starts no run while any of its apps has it on. To keep a group of apps in sync
   automatically, use an ApplicationSyncPolicy instead, with `selfHeal` if drift should be reverted. Nothing is
   read from an app's own `syncPolicy.automated`.
-- **Waiting.** An app that doesn't exist yet, or already has an operation running, waits.
+- **Waiting.** An app that doesn't exist yet, or already has an operation running, waits; the run's message and a
+  `ApplicationWaiting` event say why. An app deleted, or recreated under the same name, after its sync started
+  fails, even with `onFailure: Wait`.
+- **Deadline.** `spec.activeDeadlineSeconds` fails a run that hasn't finished that long after it started, as for a
+  Job: unfinished apps fail, running operations finish, and nothing new starts.
 - **Health gate.** An app is done once its sync succeeded and it is Synced and Healthy. That status is only
   trusted once `status.sync.comparedTo` shows the app's current spec, and the controller requests a refresh
   when it doesn't.
@@ -68,19 +72,23 @@ under `status.groups`.
 - **Automatic runs.** Only runs owned by an ApplicationSyncPolicy are automatic: sync windows apply to them as to
   auto-sync, and with prune on, an app whose resources would all be pruned fails without syncing. Every other run
   is manual.
-- **Immutability.** `spec` is immutable, except `spec.paused`.
+- **Immutability.** `spec` is immutable, except `spec.ttlSecondsAfterFinished`. To stop a run, delete it: operations
+  already running finish and nothing new starts.
+- **Suspend.** A policy with `suspend: true` starts no runs, self-heal included, as a suspended CronJob starts no
+  Jobs. A run already going continues; delete it to stop the rollout.
 - **Self-heal.** A policy with `selfHeal: true` starts another run for the same change when an app drifts after a
   successful run, syncing only the resources that aren't Synced. Runs are spaced by the same
   `controller.self.heal.*` settings in `argocd-cmd-params-cm` that Argo CD's auto-sync uses. An app the run left
-  OutOfSync, as `doneWhen: Healthy` allows, isn't treated as drift.
-- **Observed generation.** Both resources set `status.observedGeneration`, so you can tell when a `paused` change
-  or a policy edit has been picked up.
+  OutOfSync, as `doneWhen: Healthy` allows, isn't treated as drift and is left out of self-heal runs.
+- **Observed generation.** Both resources set `status.observedGeneration`, so you can tell when a TTL change or a
+  policy edit has been picked up.
 - **History.** Each app keeps its 20 most recent completed ApplicationSyncs (`--history-limit`); a run is deleted
-  once it is among the newest 20 for none of its apps.
+  once it is among the newest 20 for none of its apps. `spec.ttlSecondsAfterFinished` also deletes a run that many
+  seconds after it finishes, as for a Job; a policy's latest run is kept until a newer one replaces it.
 
 | Field | Effect |
 |---|---|
-| `groups[].maxParallel` | How many apps of the group sync at once, as a number or a percentage. `0` pauses the group. |
+| `groups[].maxParallel` | How many apps of the group sync at once, as a number or a percentage; at least 1 or 1%. |
 | `groups[].apps[].revisions` | Pins sources, by `source` name or 1-based `position`. Revisions are passed to the sync as given, so use commit SHAs to be sure every app gets the same one. Sources that aren't listed sync to their `targetRevision`. |
 | `groups[].apps[].prune`, `.retry`, `.resources` | Per-app prune, retry and partial sync. |
 | `doneWhen: Healthy` | Healthy is enough; OutOfSync doesn't block. |
@@ -120,6 +128,7 @@ make codegen-local        # deepcopy, CRDs and ClusterRole from the kubebuilder 
 make build-local
 make lint-local           # golangci-lint with Argo CD's config, applying fixes
 make test-local           # TEST_MODULE=./internal/controller for one package
+make test-e2e-local       # e2e suite against the current cluster, in its own namespace
 make pre-commit-local     # all of the above; run it before committing
 ```
 

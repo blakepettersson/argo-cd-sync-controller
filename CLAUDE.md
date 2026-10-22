@@ -11,6 +11,7 @@ make codegen-local        # deepcopy, CRDs (config/crd/bases) and ClusterRole (c
 make build-local          # dist/argo-cd-sync-controller
 make lint-local           # golangci-lint v2.13.2 with argo-cd's config, --fix
 make test-local           # go test -race -cover; TEST_MODULE=./internal/controller for one package
+make test-e2e-local       # builds, installs the CRDs, and runs test/e2e against the current kube context
 make pre-commit-local     # codegen, build, lint, test: must pass before committing
 
 go test -race ./internal/controller -run TestDependencyOrder   # single test
@@ -41,8 +42,9 @@ Argo CD. It **never calls Argo CD's API server or repo server**: it writes `Appl
 API does, and reads results back from `status.operationState`. Argo CD's application controller does the actual
 syncing. The CRDs use `argoproj.io/v1alpha1` on purpose, because the plan is to move this into Argo CD itself.
 
-- `ApplicationSync` — a one-off, immutable (except `spec.paused`, enforced by a CEL rule on the spec type) request
-  to sync groups of apps; groups have `dependsOn`.
+- `ApplicationSync` — a one-off, immutable (except `spec.ttlSecondsAfterFinished`, enforced by a CEL rule on the
+  spec type) request to sync groups of apps; groups have `dependsOn`, and `activeDeadlineSeconds`
+  fails a run that doesn't finish in time.
 - `ApplicationSyncPolicy` — auto-sync for a group: creates an owned `ApplicationSync` from `spec.template` when an
   app is OutOfSync.
 
@@ -62,17 +64,19 @@ these (see "Future work: auto-sync and RollingSync as policies" in `../argo-cd/d
   become "one policy per app", with the generated policy counting as that one.
 - **RollingSync as a generated policy.** An ApplicationSet would generate one policy: `steps` become groups,
   `maxUpdate` becomes `maxParallel`, and `concurrencyPolicy: Replace` restarts the rollout on a new change. Pausing
-  with `maxUpdate: 0` needs a policy-level `paused` that is passed on to the running ApplicationSync.
+  with `maxUpdate: 0` means generating a template that stops before that step, or suspending the policy at the first
+  step; `maxParallel` can't be 0.
 
 ## Architecture (`internal/controller`)
 
 - `applicationsync_controller.go` — `ApplicationSyncReconciler`. Each reconcile walks groups in `groupOrder`,
-  advancing per-group/per-app phases in `status.groups`, and requeues every 30s until completed. Completed syncs
-  are never reconciled again and are then garbage-collected (`gc`, keyed by `historyKey` = the set of app names,
-  `--history-limit`). It is woken by Application changes through a field index (`appIndex`) of app names.
+  advancing per-group/per-app phases in `status.groups`, and requeues every 30s until completed. Completed syncs are
+  only revisited to delete them: `gc` keeps each app's newest `--history-limit` runs, and `expire` applies
+  `ttlSecondsAfterFinished`, sparing a policy's latest run. It is woken by Application changes through a field index
+  (`appIndex`) of app names.
 - `applicationsyncpolicy_controller.go` — `ApplicationSyncPolicyReconciler`. Only acts on app status that is fresh
   (`comparedToCurrentSpec`), otherwise requests a refresh. Pins every source to the currently compared revision
-  (`pinFromStatus`) and records the change in an annotation so the same change isn't retried (mirrors auto-sync).
+  (`pinFromStatus`) and records the change in its status so the same change isn't retried (mirrors auto-sync).
   `concurrencyPolicy: Replace` deletes the in-flight run.
 - `argocd.go` — everything the controller needs from Argo CD, only via the Kubernetes API: reading apps/AppProjects,
   `argocd-cm`/`argocd-cmd-params-cm` settings (read uncached via `APIReader`), `setOperation` (fails if an

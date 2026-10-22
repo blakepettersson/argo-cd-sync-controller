@@ -44,6 +44,9 @@ func autoSyncEnabled(app *argov1alpha1.Application) bool {
 // errAnotherOperationInProgress mirrors the Sync API's error when an app already has an operation.
 var errAnotherOperationInProgress = errors.New("another operation is already in progress")
 
+// errApplicationReplaced means the live app is a newer one than the cached copy the checks ran against.
+var errApplicationReplaced = errors.New("application was replaced")
+
 // errApplicationSyncGone is returned when the ApplicationSync was deleted, or replaced by a same-named one, since it
 // was read from the cache.
 var errApplicationSyncGone = errors.New("the ApplicationSync no longer exists")
@@ -153,13 +156,17 @@ func (a *argoCD) replaceAllowed(ctx context.Context) (bool, error) {
 	return a.boolSetting(ctx, argoCDCmdParamsMap, replaceAllowedKey, true)
 }
 
-// setOperation writes op on the app, as the Sync API does: it fails if an operation is already set, and
-// clears the previous operationState in the same update.
-func (a *argoCD) setOperation(ctx context.Context, namespace, name string, op *argov1alpha1.Operation) error {
+// setOperation writes op on the live app, as the Sync API does: it fails if an operation is already set, and
+// clears the previous operationState in the same update. It also fails if the live app isn't the one with uid that
+// the caller checked.
+func (a *argoCD) setOperation(ctx context.Context, namespace, name string, uid types.UID, op *argov1alpha1.Operation) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		app, err := a.getLiveApp(ctx, namespace, name)
 		if err != nil {
 			return err
+		}
+		if app.UID != uid {
+			return errApplicationReplaced
 		}
 		if app.Operation != nil {
 			return errAnotherOperationInProgress

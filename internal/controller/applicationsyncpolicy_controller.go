@@ -6,6 +6,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
+	"slices"
+	"strings"
 	"time"
 
 	argov1alpha1 "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
@@ -105,6 +108,10 @@ func (r *ApplicationSyncPolicyReconciler) reconcilePolicy(ctx context.Context, p
 		p.Status.Message = "the template lists no applications"
 		return 0, nil
 	}
+	if p.Spec.Suspend {
+		p.Status.Message = "suspended"
+		return 0, nil
+	}
 
 	// Labels, owner references and annotations can be set by anyone who can create ApplicationSyncs, so the
 	// policy's run is the one whose name and UID its own status records, as returned by the policy's create.
@@ -153,6 +160,7 @@ func (r *ApplicationSyncPolicyReconciler) reconcilePolicy(ctx context.Context, p
 
 	change := policyChange(names, apps)
 	selfHeal := false
+	var left map[string]bool
 	if current != nil && p.Status.CurrentRunChange == change {
 		// Same revisions and sources as the last run: like auto-sync, don't retry what was already attempted,
 		// and only self-heal drift after a run that succeeded.
@@ -164,10 +172,18 @@ func (r *ApplicationSyncPolicyReconciler) reconcilePolicy(ctx context.Context, p
 			p.Status.Message = fmt.Sprintf("run %s already handled this change (%s)", current.Name, current.Status.Phase)
 			return 0, nil
 		}
-		// Only drift that appeared after the run is healed. An app the run left OutOfSync, as doneWhen: Healthy
-		// allows, would otherwise start a new run on every backoff forever.
-		if name := leftOutOfSync(current, apps); name != "" {
-			p.Status.Message = fmt.Sprintf("run %s left application %q OutOfSync; not self-healing this change", current.Name, name)
+		// Only drift that appeared after the run is healed. An app the run left OutOfSync, as doneWhen: Healthy or a
+		// template pin behind its targetRevision allows, would otherwise start a new run on every backoff forever, so
+		// it is left out and the others are still healed.
+		left = leftOutOfSync(current, apps)
+		healable := false
+		for name, app := range apps {
+			if app.Status.Sync.Status == argov1alpha1.SyncStatusCodeOutOfSync && !left[name] {
+				healable = true
+			}
+		}
+		if !healable {
+			p.Status.Message = fmt.Sprintf("run %s left %s OutOfSync; nothing else drifted", current.Name, strings.Join(slices.Sorted(maps.Keys(left)), ", "))
 			return 0, nil
 		}
 		remaining, err := argo.selfHealDelay(ctx, current.Status.FinishedAt, int(p.Status.SelfHealAttempts))
@@ -195,7 +211,7 @@ func (r *ApplicationSyncPolicyReconciler) reconcilePolicy(ctx context.Context, p
 		run.Spec = *p.Spec.Template.DeepCopy()
 		pinFromStatus(&run.Spec, apps)
 		if selfHeal {
-			limitToDrift(&run.Spec, apps)
+			limitToDrift(&run.Spec, apps, left)
 		}
 	})
 	if err != nil {
@@ -211,16 +227,27 @@ func (r *ApplicationSyncPolicyReconciler) reconcilePolicy(ctx context.Context, p
 	return 0, nil
 }
 
-// leftOutOfSync returns an app that is OutOfSync now and wasn't Synced when run finished with it.
-func leftOutOfSync(run *syncv1alpha1.ApplicationSync, apps map[string]*argov1alpha1.Application) string {
+// leftOutOfSync returns the apps that are OutOfSync now and weren't Synced when run finished with them. An app the
+// run doesn't list was left out of a self-heal run for that reason, so it stays left out.
+func leftOutOfSync(run *syncv1alpha1.ApplicationSync, apps map[string]*argov1alpha1.Application) map[string]bool {
+	listed := map[string]bool{}
+	for _, name := range appNames(run.Spec) {
+		listed[name] = true
+	}
+	endedWith := map[string]argov1alpha1.SyncStatusCode{}
 	for _, g := range run.Status.Groups {
 		for _, st := range g.Apps {
-			if app := apps[st.Name]; app != nil && app.Status.Sync.Status == argov1alpha1.SyncStatusCodeOutOfSync && st.SyncStatus != argov1alpha1.SyncStatusCodeSynced {
-				return st.Name
-			}
+			endedWith[st.Name] = st.SyncStatus
 		}
 	}
-	return ""
+	left := map[string]bool{}
+	for name, app := range apps {
+		status, ok := endedWith[name]
+		if app.Status.Sync.Status == argov1alpha1.SyncStatusCodeOutOfSync && (!listed[name] || ok && status != argov1alpha1.SyncStatusCodeSynced) {
+			left[name] = true
+		}
+	}
+	return left
 }
 
 // cancelUnrecordedRuns deletes every unfinished run that names p as its controller but isn't its recorded run: one
@@ -276,9 +303,11 @@ func (r *ApplicationSyncPolicyReconciler) createRun(ctx context.Context, p *sync
 
 // limitToDrift makes a self-heal run sync only what drifted, as automated.selfHeal does: Synced apps are
 // skipped, and the others sync only their resources that aren't Synced. Resources set in the template are kept.
-func limitToDrift(spec *syncv1alpha1.ApplicationSyncSpec, apps map[string]*argov1alpha1.Application) {
+// Apps in left, which the last run left OutOfSync, are dropped.
+func limitToDrift(spec *syncv1alpha1.ApplicationSyncSpec, apps map[string]*argov1alpha1.Application, left map[string]bool) {
 	spec.SkipIfSynced = true
 	for gi := range spec.Groups {
+		spec.Groups[gi].Apps = slices.DeleteFunc(spec.Groups[gi].Apps, func(a syncv1alpha1.ApplicationSyncApp) bool { return left[a.Name] })
 		for ai := range spec.Groups[gi].Apps {
 			a := &spec.Groups[gi].Apps[ai]
 			app := apps[a.Name]

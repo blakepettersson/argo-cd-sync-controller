@@ -52,9 +52,18 @@ spec:
           metadata:
             type: object
           spec:
-            description: Every field except paused is immutable. CEL can't compare
-              a struct minus one field, so each is listed.
+            description: |-
+              Every field except ttlSecondsAfterFinished is immutable. CEL can't compare a struct minus one field, so each
+              immutable one is listed.
             properties:
+              activeDeadlineSeconds:
+                description: |-
+                  ActiveDeadlineSeconds fails the run this many seconds after it started, as for a Job: every app that hasn't
+                  finished fails, operations already running finish, and nothing new starts.
+                format: int64
+                maximum: 2147483647
+                minimum: 1
+                type: integer
               allowEmpty:
                 description: |-
                   AllowEmpty lets an automated run with prune sync an app whose resources would all be pruned, as
@@ -198,8 +207,8 @@ spec:
                       - type: integer
                       - type: string
                       description: |-
-                        MaxParallel caps how many apps in the group sync at once, as a number or a percentage of the group.
-                        A percentage that rounds down to 0 becomes 1, except 0%. 0 or 0% pauses the group.
+                        MaxParallel caps how many apps in the group sync at once, as a number or a percentage of the group. It must be
+                        at least 1 or 1%, since a run can't be edited to lift a hold; a percentage that rounds down to 0 becomes 1.
                       x-kubernetes-int-or-string: true
                     name:
                       default: default
@@ -209,6 +218,10 @@ spec:
                       minLength: 1
                       type: string
                   type: object
+                  x-kubernetes-validations:
+                  - message: maxParallel must be at least 1 or 1%
+                    rule: '!has(self.maxParallel) || (type(self.maxParallel) == int
+                      ? self.maxParallel >= 1 : self.maxParallel != ''0%'')'
                 minItems: 1
                 type: array
                 x-kubernetes-list-map-keys:
@@ -243,11 +256,6 @@ spec:
                 - Fail
                 - Wait
                 type: string
-              paused:
-                description: |-
-                  Paused stops new app syncs from starting; syncs already running finish. It is the only field that can
-                  change after creation.
-                type: boolean
               prune:
                 description: Prune specifies to delete resources from the cluster
                   that are no longer tracked in git
@@ -320,11 +328,19 @@ spec:
                         type: boolean
                     type: object
                 type: object
+              ttlSecondsAfterFinished:
+                description: |-
+                  TTLSecondsAfterFinished deletes the ApplicationSync this many seconds after it finishes, as for a Job, whether
+                  or not the history limit would keep it. A policy's latest run is kept until a newer one replaces it. It can
+                  change after creation.
+                format: int32
+                minimum: 0
+                type: integer
             required:
             - groups
             type: object
             x-kubernetes-validations:
-            - message: spec is immutable, except spec.paused
+            - message: spec is immutable, except spec.ttlSecondsAfterFinished
               rule: self.groups == oldSelf.groups && has(self.prune) == has(oldSelf.prune)
                 && (!has(self.prune) || self.prune == oldSelf.prune) && has(self.dryRun)
                 == has(oldSelf.dryRun) && (!has(self.dryRun) || self.dryRun == oldSelf.dryRun)
@@ -342,6 +358,9 @@ spec:
                 == has(oldSelf.skipIfSynced) && (!has(self.skipIfSynced) || self.skipIfSynced
                 == oldSelf.skipIfSynced) && has(self.allowEmpty) == has(oldSelf.allowEmpty)
                 && (!has(self.allowEmpty) || self.allowEmpty == oldSelf.allowEmpty)
+                && has(self.activeDeadlineSeconds) == has(oldSelf.activeDeadlineSeconds)
+                && (!has(self.activeDeadlineSeconds) || self.activeDeadlineSeconds
+                == oldSelf.activeDeadlineSeconds)
           status:
             description: ApplicationSyncStatus is the observed progress of an ApplicationSync
             properties:
@@ -395,6 +414,11 @@ spec:
                           syncStatus:
                             description: 'SyncStatus is the app''s sync status when
                               it succeeded. With doneWhen: Healthy it can be OutOfSync.'
+                            type: string
+                          uid:
+                            description: |-
+                              UID is the Application's UID when its sync started. If that app is deleted or recreated before the entry
+                              finishes, the entry fails. Before its sync starts, a missing app waits and a recreated one is synced.
                             type: string
                         required:
                         - name

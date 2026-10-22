@@ -65,10 +65,23 @@ spec:
                   SelfHeal starts another run for a change the last run already synced successfully, when an app has
                   drifted since, as automated.selfHeal does. Runs are spaced by Argo CD's self-heal backoff settings.
                 type: boolean
+              suspend:
+                description: |-
+                  Suspend stops the policy from starting runs, self-heal runs included, as for a CronJob. A run already going
+                  continues; delete it to cancel it, and the policy won't start the change again until it is resumed.
+                type: boolean
               template:
                 description: Template is the spec of each ApplicationSync the policy
                   creates
                 properties:
+                  activeDeadlineSeconds:
+                    description: |-
+                      ActiveDeadlineSeconds fails the run this many seconds after it started, as for a Job: every app that hasn't
+                      finished fails, operations already running finish, and nothing new starts.
+                    format: int64
+                    maximum: 2147483647
+                    minimum: 1
+                    type: integer
                   allowEmpty:
                     description: |-
                       AllowEmpty lets an automated run with prune sync an app whose resources would all be pruned, as
@@ -212,8 +225,8 @@ spec:
                           - type: integer
                           - type: string
                           description: |-
-                            MaxParallel caps how many apps in the group sync at once, as a number or a percentage of the group.
-                            A percentage that rounds down to 0 becomes 1, except 0%. 0 or 0% pauses the group.
+                            MaxParallel caps how many apps in the group sync at once, as a number or a percentage of the group. It must be
+                            at least 1 or 1%, since a run can't be edited to lift a hold; a percentage that rounds down to 0 becomes 1.
                           x-kubernetes-int-or-string: true
                         name:
                           default: default
@@ -223,6 +236,10 @@ spec:
                           minLength: 1
                           type: string
                       type: object
+                      x-kubernetes-validations:
+                      - message: maxParallel must be at least 1 or 1%
+                        rule: '!has(self.maxParallel) || (type(self.maxParallel) ==
+                          int ? self.maxParallel >= 1 : self.maxParallel != ''0%'')'
                     minItems: 1
                     type: array
                     x-kubernetes-list-map-keys:
@@ -257,11 +274,6 @@ spec:
                     - Fail
                     - Wait
                     type: string
-                  paused:
-                    description: |-
-                      Paused stops new app syncs from starting; syncs already running finish. It is the only field that can
-                      change after creation.
-                    type: boolean
                   prune:
                     description: Prune specifies to delete resources from the cluster
                       that are no longer tracked in git
@@ -335,6 +347,14 @@ spec:
                             type: boolean
                         type: object
                     type: object
+                  ttlSecondsAfterFinished:
+                    description: |-
+                      TTLSecondsAfterFinished deletes the ApplicationSync this many seconds after it finishes, as for a Job, whether
+                      or not the history limit would keep it. A policy's latest run is kept until a newer one replaces it. It can
+                      change after creation.
+                    format: int32
+                    minimum: 0
+                    type: integer
                 required:
                 - groups
                 type: object

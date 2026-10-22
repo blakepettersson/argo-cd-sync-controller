@@ -25,8 +25,9 @@ type ApplicationSyncList struct {
 type ApplicationSync struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata"`
-	// Every field except paused is immutable. CEL can't compare a struct minus one field, so each is listed.
-	// +kubebuilder:validation:XValidation:rule="self.groups == oldSelf.groups && has(self.prune) == has(oldSelf.prune) && (!has(self.prune) || self.prune == oldSelf.prune) && has(self.dryRun) == has(oldSelf.dryRun) && (!has(self.dryRun) || self.dryRun == oldSelf.dryRun) && has(self.syncOptions) == has(oldSelf.syncOptions) && (!has(self.syncOptions) || self.syncOptions == oldSelf.syncOptions) && has(self.syncStrategy) == has(oldSelf.syncStrategy) && (!has(self.syncStrategy) || self.syncStrategy == oldSelf.syncStrategy) && has(self.retry) == has(oldSelf.retry) && (!has(self.retry) || self.retry == oldSelf.retry) && has(self.initiatedBy) == has(oldSelf.initiatedBy) && (!has(self.initiatedBy) || self.initiatedBy == oldSelf.initiatedBy) && has(self.info) == has(oldSelf.info) && (!has(self.info) || self.info == oldSelf.info) && has(self.onFailure) == has(oldSelf.onFailure) && (!has(self.onFailure) || self.onFailure == oldSelf.onFailure) && has(self.doneWhen) == has(oldSelf.doneWhen) && (!has(self.doneWhen) || self.doneWhen == oldSelf.doneWhen) && has(self.skipIfSynced) == has(oldSelf.skipIfSynced) && (!has(self.skipIfSynced) || self.skipIfSynced == oldSelf.skipIfSynced) && has(self.allowEmpty) == has(oldSelf.allowEmpty) && (!has(self.allowEmpty) || self.allowEmpty == oldSelf.allowEmpty)",message="spec is immutable, except spec.paused"
+	// Every field except ttlSecondsAfterFinished is immutable. CEL can't compare a struct minus one field, so each
+	// immutable one is listed.
+	// +kubebuilder:validation:XValidation:rule="self.groups == oldSelf.groups && has(self.prune) == has(oldSelf.prune) && (!has(self.prune) || self.prune == oldSelf.prune) && has(self.dryRun) == has(oldSelf.dryRun) && (!has(self.dryRun) || self.dryRun == oldSelf.dryRun) && has(self.syncOptions) == has(oldSelf.syncOptions) && (!has(self.syncOptions) || self.syncOptions == oldSelf.syncOptions) && has(self.syncStrategy) == has(oldSelf.syncStrategy) && (!has(self.syncStrategy) || self.syncStrategy == oldSelf.syncStrategy) && has(self.retry) == has(oldSelf.retry) && (!has(self.retry) || self.retry == oldSelf.retry) && has(self.initiatedBy) == has(oldSelf.initiatedBy) && (!has(self.initiatedBy) || self.initiatedBy == oldSelf.initiatedBy) && has(self.info) == has(oldSelf.info) && (!has(self.info) || self.info == oldSelf.info) && has(self.onFailure) == has(oldSelf.onFailure) && (!has(self.onFailure) || self.onFailure == oldSelf.onFailure) && has(self.doneWhen) == has(oldSelf.doneWhen) && (!has(self.doneWhen) || self.doneWhen == oldSelf.doneWhen) && has(self.skipIfSynced) == has(oldSelf.skipIfSynced) && (!has(self.skipIfSynced) || self.skipIfSynced == oldSelf.skipIfSynced) && has(self.allowEmpty) == has(oldSelf.allowEmpty) && (!has(self.allowEmpty) || self.allowEmpty == oldSelf.allowEmpty) && has(self.activeDeadlineSeconds) == has(oldSelf.activeDeadlineSeconds) && (!has(self.activeDeadlineSeconds) || self.activeDeadlineSeconds == oldSelf.activeDeadlineSeconds)",message="spec is immutable, except spec.ttlSecondsAfterFinished"
 	Spec   ApplicationSyncSpec   `json:"spec"`
 	Status ApplicationSyncStatus `json:"status,omitempty"`
 }
@@ -62,9 +63,16 @@ type ApplicationSyncSpec struct {
 	DoneWhen ApplicationSyncDoneWhen `json:"doneWhen,omitempty"`
 	// SkipIfSynced counts an app that is already Synced at its revisions as synced, without starting a sync
 	SkipIfSynced bool `json:"skipIfSynced,omitempty"`
-	// Paused stops new app syncs from starting; syncs already running finish. It is the only field that can
+	// TTLSecondsAfterFinished deletes the ApplicationSync this many seconds after it finishes, as for a Job, whether
+	// or not the history limit would keep it. A policy's latest run is kept until a newer one replaces it. It can
 	// change after creation.
-	Paused bool `json:"paused,omitempty"`
+	// +kubebuilder:validation:Minimum=0
+	TTLSecondsAfterFinished *int32 `json:"ttlSecondsAfterFinished,omitempty"`
+	// ActiveDeadlineSeconds fails the run this many seconds after it started, as for a Job: every app that hasn't
+	// finished fails, operations already running finish, and nothing new starts.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=2147483647
+	ActiveDeadlineSeconds *int64 `json:"activeDeadlineSeconds,omitempty"`
 	// AllowEmpty lets an automated run with prune sync an app whose resources would all be pruned, as
 	// automated.allowEmpty does for auto-sync. An app with no resources at all is never blocked.
 	AllowEmpty bool `json:"allowEmpty,omitempty"`
@@ -87,6 +95,7 @@ const (
 )
 
 // ApplicationSyncGroup is a set of Applications synced in parallel, after the groups it depends on.
+// +kubebuilder:validation:XValidation:rule="!has(self.maxParallel) || (type(self.maxParallel) == int ? self.maxParallel >= 1 : self.maxParallel != '0%')",message="maxParallel must be at least 1 or 1%"
 type ApplicationSyncGroup struct {
 	// Name of the group, unique within the ApplicationSync. Defaults to "default", so it can be left out when there
 	// is only one group; two unnamed groups are rejected as duplicates.
@@ -100,8 +109,8 @@ type ApplicationSyncGroup struct {
 	// +listType=map
 	// +listMapKey=name
 	Apps []ApplicationSyncApp `json:"apps,omitempty"`
-	// MaxParallel caps how many apps in the group sync at once, as a number or a percentage of the group.
-	// A percentage that rounds down to 0 becomes 1, except 0%. 0 or 0% pauses the group.
+	// MaxParallel caps how many apps in the group sync at once, as a number or a percentage of the group. It must be
+	// at least 1 or 1%, since a run can't be edited to lift a hold; a percentage that rounds down to 0 becomes 1.
 	MaxParallel *intstr.IntOrString `json:"maxParallel,omitempty"`
 }
 
@@ -207,6 +216,9 @@ type ApplicationSyncAppStatus struct {
 	FinishedAt *metav1.Time `json:"finishedAt,omitempty"`
 	// SyncStatus is the app's sync status when it succeeded. With doneWhen: Healthy it can be OutOfSync.
 	SyncStatus argov1alpha1.SyncStatusCode `json:"syncStatus,omitempty"`
+	// UID is the Application's UID when its sync started. If that app is deleted or recreated before the entry
+	// finishes, the entry fails. Before its sync starts, a missing app waits and a recreated one is synced.
+	UID types.UID `json:"uid,omitempty"`
 }
 
 // ApplicationSyncPolicyList is a list of ApplicationSyncPolicy resources
@@ -233,6 +245,9 @@ type ApplicationSyncPolicy struct {
 
 // ApplicationSyncPolicySpec is the template for the ApplicationSyncs a policy creates
 type ApplicationSyncPolicySpec struct {
+	// Suspend stops the policy from starting runs, self-heal runs included, as for a CronJob. A run already going
+	// continues; delete it to cancel it, and the policy won't start the change again until it is resumed.
+	Suspend bool `json:"suspend,omitempty"`
 	// ConcurrencyPolicy decides what happens when apps drift while a run is unfinished: Forbid (default) waits for
 	// it to finish, Replace deletes it and starts a new one
 	// +kubebuilder:validation:Enum=Forbid;Replace

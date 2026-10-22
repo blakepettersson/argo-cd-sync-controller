@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -347,6 +349,8 @@ func TestOnFailureWait(t *testing.T) {
 	reconcileSync(t, r, s)
 	assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseProgressing, appStatus(t, s, "db").Phase)
 	assert.Equal(t, map[string]syncv1alpha1.ApplicationSyncPhase{"data": "Running", "backend": "Pending"}, groupPhases(s))
+	assert.Contains(t, s.Status.Message, "application db: sync failed", "the run says what it waits on")
+	assert.True(t, strings.HasSuffix(s.Status.Message, waitingToRecoverSuffix))
 
 	updateTestApp(t, r.Client, "db", func(app *argov1alpha1.Application) {
 		app.Status.Sync.Status = argov1alpha1.SyncStatusCodeSynced
@@ -415,7 +419,7 @@ func TestSkipIfSynced(t *testing.T) {
 	assert.Nil(t, getTestApp(t, r.Client, "db").Operation)
 }
 
-func TestMaxParallelAndPause(t *testing.T) {
+func TestMaxParallel(t *testing.T) {
 	for _, tc := range []struct {
 		maxParallel intstr.IntOrString
 		running     int
@@ -423,7 +427,7 @@ func TestMaxParallelAndPause(t *testing.T) {
 	}{
 		{intstr.FromInt32(1), 1, "waiting for one of 1 parallel slots"},
 		{intstr.FromString("10%"), 1, "waiting for one of 1 parallel slots"},
-		{intstr.FromInt32(0), 0, "paused by maxParallel"},
+		{intstr.FromInt32(0), 1, "waiting for one of 1 parallel slots"}, // rejected by the CRD; never a hold
 	} {
 		t.Run(tc.maxParallel.String(), func(t *testing.T) {
 			r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, testApp("a"), testApp("b"))...)
@@ -441,19 +445,6 @@ func TestMaxParallelAndPause(t *testing.T) {
 			assert.Equal(t, tc.message, appStatus(t, s, "b").Message)
 		})
 	}
-
-	t.Run("spec.paused", func(t *testing.T) {
-		r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, testApp("db"))...)
-		s := newSync(group("data", nil, "db"))
-		s.Spec.Paused = true
-		reconcileSync(t, r, s)
-		assert.Equal(t, "paused", s.Status.Message)
-		assert.Nil(t, getTestApp(t, r.Client, "db").Operation)
-
-		s.Spec.Paused = false
-		reconcileSync(t, r, s)
-		assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseRunning, appStatus(t, s, "db").Phase)
-	})
 }
 
 func TestOperationFields(t *testing.T) {
@@ -560,11 +551,17 @@ func TestReconcileWritesStatusAndGarbageCollects(t *testing.T) {
 	app := testApp("db")
 	app.Status.Sync.Status = argov1alpha1.SyncStatusCodeSynced
 	app.Status.Health.Status = health.HealthStatusHealthy
+	// policy-old is among neither app's newest two, but is its policy's latest run.
+	policyRun := completed("policy-old", -1, "db")
+	ownByPolicy(policyRun)
+	policy := newTestPolicy("")
+	policy.Status.CurrentRunUID = policyRun.UID
 	current := newSync(group("data", nil, "db"))
 	current.Name = "current"
 	current.Spec.SkipIfSynced = true
-	r := newTestReconciler(t, testProject(nil), app, current, completed("old-1", 1, "db"), completed("old-2", 2, "db"),
-		completed("pair", 1, "db", "web"), completed("web-only", 3, "web"), completed("pair-old", 0, "db", "web"))
+	r := newTestReconciler(t, testProject(nil), app, current, policy, completed("old-1", 1, "db"), completed("old-2", 2, "db"),
+		completed("pair", 1, "db", "web"), completed("web-only", 3, "web"), completed("pair-old", 0, "db", "web"),
+		completed("no-apps", 0), policyRun)
 	r.HistoryLimit = 2
 
 	_, err := r.Reconcile(t.Context(), ctrlRequest(current))
@@ -581,8 +578,9 @@ func TestReconcileWritesStatusAndGarbageCollects(t *testing.T) {
 		names = append(names, s.Name)
 	}
 	// Each app keeps its newest two: db keeps current and old-2, web keeps web-only and pair. pair-old is among
-	// neither app's newest two, even though it is one of only two runs for the set {db, web}.
-	assert.ElementsMatch(t, []string{"current", "old-2", "pair", "web-only"}, names)
+	// neither app's newest two, even though it is one of only two runs for the set {db, web}. no-apps counts toward
+	// no app, so only a TTL deletes it.
+	assert.ElementsMatch(t, []string{"current", "old-2", "pair", "web-only", "no-apps", "policy-old"}, names)
 }
 
 func TestOperationFromRecreatedApplicationSyncIsNotAdopted(t *testing.T) {
@@ -627,10 +625,10 @@ func TestReconcileRecordsObservedGeneration(t *testing.T) {
 	got := get()
 	assert.Equal(t, int64(1), got.Status.ObservedGeneration)
 
-	// A finished ApplicationSync still records that a later spec.paused edit was seen.
+	// A finished ApplicationSync still records that a later TTL edit was seen.
 	got.Status.Phase = syncv1alpha1.ApplicationSyncPhaseSucceeded
 	require.NoError(t, r.Status().Update(t.Context(), got))
-	got.Spec.Paused = true
+	got.Spec.TTLSecondsAfterFinished = new(int32(3600))
 	got.Generation = 2
 	require.NoError(t, r.Update(t.Context(), got))
 	_, err = r.Reconcile(t.Context(), ctrlRequest(s))
@@ -698,4 +696,355 @@ func TestRefusesAutoSyncedApp(t *testing.T) {
 	updateTestApp(t, r.Client, "db", func(app *argov1alpha1.Application) { app.Spec.SyncPolicy.Automated.Enabled = new(false) })
 	reconcileSync(t, r, s)
 	assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseRunning, appStatus(t, s, "db").Phase)
+}
+
+func TestDeletedApplication(t *testing.T) {
+	newApps := func() (*argov1alpha1.Application, *argov1alpha1.Application) {
+		db, api := testApp("db"), testApp("api")
+		db.UID, api.UID = "db-uid", "api-uid"
+		return db, api
+	}
+	newWaitSync := func() *syncv1alpha1.ApplicationSync {
+		s := newSync(group("data", nil, "db"), group("backend", []string{"data"}, "api"))
+		s.Spec.OnFailure = syncv1alpha1.ApplicationSyncOnFailureWait
+		return s
+	}
+
+	t.Run("deleted after its sync started fails, even with onFailure: Wait", func(t *testing.T) {
+		db, api := newApps()
+		r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, db, api)...)
+		s := newWaitSync()
+		reconcileSync(t, r, s)
+		require.Equal(t, types.UID("db-uid"), appStatus(t, s, "db").UID, "the UID is recorded when the sync starts")
+
+		require.NoError(t, r.Delete(t.Context(), db))
+		reconcileSync(t, r, s)
+		st := appStatus(t, s, "db")
+		assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseFailed, st.Phase)
+		assert.Equal(t, "application was deleted or recreated", st.Message)
+	})
+	t.Run("recreated after its sync started fails", func(t *testing.T) {
+		db, api := newApps()
+		r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, db, api)...)
+		s := newWaitSync()
+		reconcileSync(t, r, s)
+
+		require.NoError(t, r.Delete(t.Context(), db))
+		recreated := testApp("db")
+		recreated.UID = "db-uid-2"
+		require.NoError(t, r.Create(t.Context(), recreated))
+		reconcileSync(t, r, s)
+		assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseFailed, appStatus(t, s, "db").Phase)
+	})
+	t.Run("deleted before its sync starts waits", func(t *testing.T) {
+		db, api := newApps()
+		r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, db, api)...)
+		s := newWaitSync()
+		reconcileSync(t, r, s)
+		require.Empty(t, appStatus(t, s, "api").UID)
+
+		require.NoError(t, r.Delete(t.Context(), api))
+		finishOperation(t, r.Client, "db", synccommon.OperationSucceeded, health.HealthStatusHealthy)
+		reconcileSync(t, r, s)
+		st := appStatus(t, s, "api")
+		assert.Equal(t, syncv1alpha1.ApplicationSyncPhasePending, st.Phase)
+		assert.Equal(t, waitingForAppMessage, st.Message)
+	})
+	t.Run("recreated before its sync starts is synced", func(t *testing.T) {
+		db, api := newApps()
+		r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, db, api)...)
+		s := newWaitSync()
+		reconcileSync(t, r, s)
+
+		require.NoError(t, r.Delete(t.Context(), api))
+		recreated := testApp("api")
+		recreated.UID = "api-uid-2"
+		require.NoError(t, r.Create(t.Context(), recreated))
+		finishOperation(t, r.Client, "db", synccommon.OperationSucceeded, health.HealthStatusHealthy)
+		reconcileSync(t, r, s)
+		assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseRunning, appStatus(t, s, "api").Phase)
+		assert.Equal(t, types.UID("api-uid-2"), appStatus(t, s, "api").UID)
+		assert.NotNil(t, getTestApp(t, r.Client, "api").Operation)
+	})
+	t.Run("recreated while the cache still holds the old app fails, even with onFailure: Wait", func(t *testing.T) {
+		db, api := newApps()
+		r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, db, api)...)
+		s := newWaitSync()
+		reconcileSync(t, r, s)
+		require.Equal(t, syncv1alpha1.ApplicationSyncPhaseRunning, appStatus(t, s, "db").Phase)
+
+		// The cache still has the old db, without this run's operation; the API server has the recreated one.
+		updateTestApp(t, r.Client, "db", func(app *argov1alpha1.Application) { app.Operation = nil })
+		recreated := testApp("db")
+		recreated.UID = "db-uid-2"
+		r.APIReader = fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(recreated).Build()
+		reconcileSync(t, r, s)
+		st := appStatus(t, s, "db")
+		assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseFailed, st.Phase)
+		assert.Equal(t, "application was deleted or recreated", st.Message)
+	})
+	t.Run("an app the cache doesn't show as recreated yet isn't synced until it does", func(t *testing.T) {
+		db, api := newApps()
+		r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, db, api)...)
+		s := newWaitSync()
+		recreated := testApp("db")
+		recreated.UID = "db-uid-2"
+		live := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(recreated, s.DeepCopy()).Build()
+		r.APIReader = live
+		reconcileSync(t, r, s)
+
+		st := appStatus(t, s, "db")
+		assert.Equal(t, syncv1alpha1.ApplicationSyncPhasePending, st.Phase, "the checks ran against the old app")
+		assert.Equal(t, "waiting for the cache to catch up with a recreated application", st.Message)
+		var got argov1alpha1.Application
+		require.NoError(t, live.Get(t.Context(), client.ObjectKeyFromObject(recreated), &got))
+		assert.Nil(t, got.Operation)
+	})
+	t.Run("a finished app keeps its phase", func(t *testing.T) {
+		db, api := newApps()
+		r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, db, api)...)
+		s := newWaitSync()
+		reconcileSync(t, r, s)
+		finishOperation(t, r.Client, "db", synccommon.OperationSucceeded, health.HealthStatusHealthy)
+		reconcileSync(t, r, s)
+		require.Equal(t, syncv1alpha1.ApplicationSyncPhaseSucceeded, appStatus(t, s, "db").Phase)
+
+		require.NoError(t, r.Delete(t.Context(), getTestApp(t, r.Client, "db")))
+		reconcileSync(t, r, s)
+		assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseSucceeded, appStatus(t, s, "db").Phase)
+	})
+}
+
+func TestActiveDeadlineSeconds(t *testing.T) {
+	r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, testApp("db"))...)
+	s := newSync(group("data", nil, "db"), group("backend", []string{"data"}, "missing"))
+	deadline := int64(60)
+	s.Spec.ActiveDeadlineSeconds = &deadline
+	reconcileSync(t, r, s)
+	require.Equal(t, syncv1alpha1.ApplicationSyncPhaseRunning, s.Status.Phase)
+
+	finishOperation(t, r.Client, "db", synccommon.OperationSucceeded, health.HealthStatusHealthy)
+	reconcileSync(t, r, s)
+	require.Equal(t, waitingForAppMessage, appStatus(t, s, "missing").Message)
+	assert.Equal(t, "application missing: waiting for application to exist", s.Status.Message, "the run says what it waits on")
+
+	started := metav1.NewTime(time.Now().Add(-2 * time.Minute))
+	s.Status.StartedAt = &started
+	reconcileSync(t, r, s)
+	assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseFailed, s.Status.Phase)
+	assert.Equal(t, "exceeded activeDeadlineSeconds (60s)", s.Status.Message)
+	assert.NotNil(t, s.Status.FinishedAt)
+	assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseSucceeded, appStatus(t, s, "db").Phase, "finished apps keep their phase")
+	missing := appStatus(t, s, "missing")
+	assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseFailed, missing.Phase)
+	assert.Equal(t, "exceeded activeDeadlineSeconds (60s)", missing.Message)
+
+	t.Run("a group whose dependency finishes after the deadline is Skipped", func(t *testing.T) {
+		r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, testApp("db"), testApp("api"))...)
+		s := newSync(group("data", nil, "db"), group("backend", []string{"data"}, "api"))
+		s.Spec.ActiveDeadlineSeconds = &deadline
+		reconcileSync(t, r, s)
+		finishOperation(t, r.Client, "db", synccommon.OperationSucceeded, health.HealthStatusHealthy)
+		s.Status.StartedAt = &started
+		reconcileSync(t, r, s)
+		assert.Equal(t, map[string]syncv1alpha1.ApplicationSyncPhase{"data": "Succeeded", "backend": "Skipped"}, groupPhases(s))
+	})
+	t.Run("groups that never started are Skipped", func(t *testing.T) {
+		r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, testApp("db"), testApp("api"))...)
+		s := newSync(group("data", nil, "db"), group("backend", []string{"data"}, "api"))
+		s.Spec.ActiveDeadlineSeconds = &deadline
+		reconcileSync(t, r, s)
+		s.Status.StartedAt = &started
+		reconcileSync(t, r, s)
+		assert.Equal(t, map[string]syncv1alpha1.ApplicationSyncPhase{"data": "Failed", "backend": "Skipped"}, groupPhases(s))
+		assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseSkipped, appStatus(t, s, "api").Phase)
+	})
+}
+
+func TestActiveDeadlineAfterReconcile(t *testing.T) {
+	r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, testApp("db"), testApp("api"))...)
+	s := newSync(group("data", nil, "db"), group("backend", []string{"data"}, "api"))
+	deadline := int64(60)
+	s.Spec.ActiveDeadlineSeconds = &deadline
+	reconcileSync(t, r, s)
+	finishOperation(t, r.Client, "db", synccommon.OperationSucceeded, health.HealthStatusHealthy)
+
+	// db finishes in the same pass the deadline is found to have passed.
+	started := metav1.NewTime(time.Now().Add(-2 * time.Minute))
+	s.Status.StartedAt = &started
+	reconcileSync(t, r, s)
+	assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseSucceeded, appStatus(t, s, "db").Phase, "an app that finished keeps its result")
+	assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseSkipped, appStatus(t, s, "api").Phase)
+	assert.Nil(t, getTestApp(t, r.Client, "api").Operation, "nothing new starts after the deadline")
+	assert.Equal(t, map[string]syncv1alpha1.ApplicationSyncPhase{"data": "Succeeded", "backend": "Skipped"}, groupPhases(s))
+	assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseFailed, s.Status.Phase)
+}
+
+func TestWaitMessagePrefersActionableWait(t *testing.T) {
+	r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, testApp("a"))...)
+	g := group("all", nil, "missing", "a", "b")
+	g.MaxParallel = new(intstr.FromInt32(1))
+	s := newSync(g)
+	reconcileSync(t, r, s)
+	require.Contains(t, appStatus(t, s, "b").Message, waitingForSlotPrefix)
+	assert.Equal(t, "application missing: waiting for application to exist", s.Status.Message)
+}
+
+func TestRecoveryWaitReportedOnce(t *testing.T) {
+	r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, testApp("db"))...)
+	recorder := events.NewFakeRecorder(10)
+	r.Recorder = recorder
+	s := newSync(group("data", nil, "db"))
+	s.Spec.OnFailure = syncv1alpha1.ApplicationSyncOnFailureWait
+	require.NoError(t, r.Create(t.Context(), s))
+
+	reconcile := func() {
+		t.Helper()
+		_, err := r.Reconcile(t.Context(), ctrlRequest(s))
+		require.NoError(t, err)
+	}
+	reconcile()
+	finishOperation(t, r.Client, "db", synccommon.OperationFailed, health.HealthStatusDegraded)
+	reconcile()
+	// The next pass rewrites the message ("application is Degraded; ..."); the wait was already reported.
+	reconcile()
+	require.NoError(t, r.Get(t.Context(), client.ObjectKeyFromObject(s), s))
+	require.Equal(t, "application is Degraded"+waitingToRecoverSuffix, appStatus(t, s, "db").Message)
+
+	close(recorder.Events)
+	var waits []string
+	for e := range recorder.Events {
+		if strings.Contains(e, "ApplicationWaiting") {
+			waits = append(waits, e)
+		}
+	}
+	require.Len(t, waits, 1)
+	assert.True(t, strings.HasSuffix(waits[0], waitingToRecoverSuffix))
+}
+
+func TestGarbageCollectionBreaksTiesByCreation(t *testing.T) {
+	finished := metav1.NewTime(time.Now().Add(-time.Minute).Truncate(time.Second))
+	run := func(name string, created time.Time) *syncv1alpha1.ApplicationSync {
+		s := newSync(group("all", nil, "db"))
+		s.Name, s.UID = name, types.UID(name)
+		s.CreationTimestamp = metav1.NewTime(created)
+		s.Status.Phase = syncv1alpha1.ApplicationSyncPhaseSucceeded
+		s.Status.FinishedAt = &finished
+		return s
+	}
+	// Same finishedAt; "a-newer" was created later but sorts first by name.
+	older, newer := run("z-older", time.Now().Add(-time.Hour)), run("a-newer", time.Now().Add(-30*time.Minute))
+	r := newTestReconciler(t, older, newer)
+	r.HistoryLimit = 1
+	r.gc(t.Context(), newer)
+
+	var list syncv1alpha1.ApplicationSyncList
+	require.NoError(t, r.List(t.Context(), &list))
+	require.Len(t, list.Items, 1)
+	assert.Equal(t, "a-newer", list.Items[0].Name)
+}
+
+func TestWaitEvents(t *testing.T) {
+	r := newTestReconciler(t, testProject(nil))
+	recorder := events.NewFakeRecorder(10)
+	r.Recorder = recorder
+	s := newSync(group("data", nil, "db"))
+	require.NoError(t, r.Create(t.Context(), s))
+
+	_, err := r.Reconcile(t.Context(), ctrlRequest(s))
+	require.NoError(t, err)
+	_, err = r.Reconcile(t.Context(), ctrlRequest(s))
+	require.NoError(t, err)
+	require.Len(t, recorder.Events, 1, "an unchanged wait is reported once")
+	assert.Equal(t, "Warning ApplicationWaiting application db: waiting for application to exist", <-recorder.Events)
+
+	t.Run("waiting for a refresh isn't reported", func(t *testing.T) {
+		db := testApp("db")
+		db.Status.ReconciledAt = nil
+		r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, db)...)
+		recorder := events.NewFakeRecorder(10)
+		r.Recorder = recorder
+		s := newSync(group("data", nil, "db"))
+		s.Name = "stale"
+		s.Spec.SkipIfSynced = true
+		require.NoError(t, r.Create(t.Context(), s))
+		_, err := r.Reconcile(t.Context(), ctrlRequest(s))
+		require.NoError(t, err)
+		require.NoError(t, r.Get(t.Context(), client.ObjectKeyFromObject(s), s))
+		require.Equal(t, waitingForRefreshMessage, appStatus(t, s, "db").Message)
+		assert.Empty(t, recorder.Events)
+	})
+	t.Run("queueing behind maxParallel isn't reported", func(t *testing.T) {
+		r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, testApp("db"), testApp("api"))...)
+		recorder := events.NewFakeRecorder(10)
+		r.Recorder = recorder
+		g := group("data", nil, "db", "api")
+		g.MaxParallel = new(intstr.FromInt32(1))
+		s := newSync(g)
+		s.Name = "queued"
+		require.NoError(t, r.Create(t.Context(), s))
+		_, err := r.Reconcile(t.Context(), ctrlRequest(s))
+		require.NoError(t, err)
+		require.NoError(t, r.Get(t.Context(), client.ObjectKeyFromObject(s), s))
+		require.Equal(t, "waiting for one of 1 parallel slots", appStatus(t, s, "api").Message)
+		close(recorder.Events)
+		for e := range recorder.Events {
+			assert.NotContains(t, e, "ApplicationWaiting")
+		}
+	})
+}
+
+func TestTTLSecondsAfterFinished(t *testing.T) {
+	completed := func(ttl int32, finished time.Time) *syncv1alpha1.ApplicationSync {
+		s := newSync(group("data", nil, "db"))
+		s.Spec.TTLSecondsAfterFinished = &ttl
+		s.Status.Phase = syncv1alpha1.ApplicationSyncPhaseSucceeded
+		f := metav1.NewTime(finished)
+		s.Status.FinishedAt = &f
+		return s
+	}
+	exists := func(t *testing.T, r *ApplicationSyncReconciler, s *syncv1alpha1.ApplicationSync) bool {
+		t.Helper()
+		err := r.Get(t.Context(), client.ObjectKeyFromObject(s), &syncv1alpha1.ApplicationSync{})
+		if apierrors.IsNotFound(err) {
+			return false
+		}
+		require.NoError(t, err)
+		return true
+	}
+
+	t.Run("deleted once the TTL has passed", func(t *testing.T) {
+		s := completed(60, time.Now().Add(-2*time.Minute))
+		r := newTestReconciler(t, s)
+		_, err := r.Reconcile(t.Context(), ctrlRequest(s))
+		require.NoError(t, err)
+		assert.False(t, exists(t, r, s))
+	})
+	t.Run("requeued until the TTL passes", func(t *testing.T) {
+		s := completed(3600, time.Now())
+		r := newTestReconciler(t, s)
+		res, err := r.Reconcile(t.Context(), ctrlRequest(s))
+		require.NoError(t, err)
+		assert.True(t, exists(t, r, s))
+		assert.InDelta(t, time.Hour, res.RequeueAfter, float64(time.Minute))
+	})
+	t.Run("a policy's current run is kept until a newer one replaces it", func(t *testing.T) {
+		s := completed(0, time.Now().Add(-time.Minute))
+		ownByPolicy(s)
+		policy := newTestPolicy("")
+		policy.Status.CurrentRunUID = s.UID
+		r := newTestReconciler(t, s, policy)
+		res, err := r.Reconcile(t.Context(), ctrlRequest(s))
+		require.NoError(t, err)
+		assert.True(t, exists(t, r, s))
+		assert.Equal(t, resyncPeriod, res.RequeueAfter)
+
+		var p syncv1alpha1.ApplicationSyncPolicy
+		require.NoError(t, r.Get(t.Context(), client.ObjectKeyFromObject(policy), &p))
+		p.Status.CurrentRunUID = "newer-run-uid"
+		require.NoError(t, r.Status().Update(t.Context(), &p))
+		_, err = r.Reconcile(t.Context(), ctrlRequest(s))
+		require.NoError(t, err)
+		assert.False(t, exists(t, r, s))
+	})
 }
