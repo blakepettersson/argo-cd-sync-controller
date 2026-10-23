@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/argoproj/argo-cd/gitops-engine/pkg/health"
-	synccommon "github.com/argoproj/argo-cd/gitops-engine/pkg/sync/common"
+	"github.com/argoproj/argo-cd/gitops-engine/v3/pkg/health"
+	synccommon "github.com/argoproj/argo-cd/gitops-engine/v3/pkg/sync/common"
 	argov1alpha1 "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -26,7 +26,7 @@ const timeout = 30 * time.Second
 func createApp(t *testing.T, name string) *argov1alpha1.Application {
 	t.Helper()
 	app := &argov1alpha1.Application{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Name: name, Namespace: namespace,
 		Spec: argov1alpha1.ApplicationSpec{
 			Project:     "default",
 			Source:      &argov1alpha1.ApplicationSource{RepoURL: "https://github.com/argoproj/argocd-example-apps.git", Path: "guestbook", TargetRevision: "HEAD"},
@@ -40,7 +40,7 @@ func createApp(t *testing.T, name string) *argov1alpha1.Application {
 
 func createSync(t *testing.T, name string, spec syncv1alpha1.ApplicationSyncSpec) *syncv1alpha1.ApplicationSync {
 	t.Helper()
-	s := &syncv1alpha1.ApplicationSync{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}, Spec: spec}
+	s := &syncv1alpha1.ApplicationSync{Name: name, Namespace: namespace, Spec: spec}
 	require.NoError(t, k8s.Create(t.Context(), s))
 	t.Cleanup(func() { _ = client.IgnoreNotFound(k8s.Delete(context.Background(), s)) })
 	return s
@@ -81,7 +81,7 @@ func syncedApp(t *testing.T, name string, status argov1alpha1.SyncStatusCode, re
 
 func updateSyncedApp(t *testing.T, name string, status argov1alpha1.SyncStatusCode, revision string) error {
 	t.Helper()
-	app, _ := get(t, &argov1alpha1.Application{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}})
+	app, _ := get(t, &argov1alpha1.Application{Name: name, Namespace: namespace})
 	now := metav1.Now()
 	if app.Operation != nil {
 		app.Status.OperationState = &argov1alpha1.OperationState{
@@ -122,8 +122,8 @@ func TestSpecIsImmutableExceptTTL(t *testing.T) {
 func TestMaxParallelMustBePositive(t *testing.T) {
 	for _, v := range []intstr.IntOrString{intstr.FromInt32(0), intstr.FromString("0%")} {
 		s := &syncv1alpha1.ApplicationSync{
-			ObjectMeta: metav1.ObjectMeta{Name: "max-parallel", Namespace: namespace},
-			Spec:       syncv1alpha1.ApplicationSyncSpec{Groups: []syncv1alpha1.ApplicationSyncGroup{{Name: "g", MaxParallel: &v}}},
+			Name: "max-parallel", Namespace: namespace,
+			Spec: syncv1alpha1.ApplicationSyncSpec{Groups: []syncv1alpha1.ApplicationSyncGroup{{Name: "g", MaxParallel: &v}}},
 		}
 		err := k8s.Create(t.Context(), s)
 		require.Error(t, err, v.String())
@@ -211,7 +211,7 @@ func TestDeletedApplication(t *testing.T) {
 			return appEntry(got, app.Name).UID == recreated.UID
 		}, timeout, 500*time.Millisecond) {
 			got, _ := get(t, s)
-			gate, _ := get(t, &argov1alpha1.Application{ObjectMeta: metav1.ObjectMeta{Name: "gate", Namespace: namespace}})
+			gate, _ := get(t, &argov1alpha1.Application{Name: "gate", Namespace: namespace})
 			t.Fatalf("run status: %+v\ngate: %+v %+v", got.Status, gate.Status.ReconciledAt, gate.Status.Sync)
 		}
 		recreated, _ = get(t, recreated)
@@ -276,7 +276,7 @@ func TestPolicyKeepsItsCurrentRunPastTTL(t *testing.T) {
 	syncedApp(t, "policy-db", argov1alpha1.SyncStatusCodeOutOfSync, "rev1")
 	ttl := int32(0)
 	policy := &syncv1alpha1.ApplicationSyncPolicy{
-		ObjectMeta: metav1.ObjectMeta{Name: "policy", Namespace: namespace},
+		Name: "policy", Namespace: namespace,
 		Spec: syncv1alpha1.ApplicationSyncPolicySpec{Template: syncv1alpha1.ApplicationSyncSpec{
 			TTLSecondsAfterFinished: &ttl,
 			Groups:                  []syncv1alpha1.ApplicationSyncGroup{{Name: "default", Apps: []syncv1alpha1.ApplicationSyncApp{{Name: "policy-db"}}}},
@@ -287,12 +287,12 @@ func TestPolicyKeepsItsCurrentRunPastTTL(t *testing.T) {
 
 	// Wait for the policy's first run to write the operation, then finish it.
 	require.Eventually(t, func() bool {
-		app, _ := get(t, &argov1alpha1.Application{ObjectMeta: metav1.ObjectMeta{Name: "policy-db", Namespace: namespace}})
+		app, _ := get(t, &argov1alpha1.Application{Name: "policy-db", Namespace: namespace})
 		return app.Operation != nil
 	}, timeout, 500*time.Millisecond)
 	syncedApp(t, "policy-db", argov1alpha1.SyncStatusCodeSynced, "rev1")
 	policy, _ = get(t, policy)
-	first := &syncv1alpha1.ApplicationSync{ObjectMeta: metav1.ObjectMeta{Name: policy.Status.CurrentRun, Namespace: namespace}}
+	first := &syncv1alpha1.ApplicationSync{Name: policy.Status.CurrentRun, Namespace: namespace}
 	require.Eventually(t, func() bool {
 		first, _ = get(t, first)
 		return first.Status.Phase == syncv1alpha1.ApplicationSyncPhaseSucceeded
@@ -320,7 +320,7 @@ func TestPolicySuspend(t *testing.T) {
 	createApp(t, "suspend-db")
 	syncedApp(t, "suspend-db", argov1alpha1.SyncStatusCodeOutOfSync, "rev1")
 	policy := &syncv1alpha1.ApplicationSyncPolicy{
-		ObjectMeta: metav1.ObjectMeta{Name: "suspend", Namespace: namespace},
+		Name: "suspend", Namespace: namespace,
 		Spec: syncv1alpha1.ApplicationSyncPolicySpec{Template: syncv1alpha1.ApplicationSyncSpec{
 			Groups: []syncv1alpha1.ApplicationSyncGroup{{Name: "default", Apps: []syncv1alpha1.ApplicationSyncApp{{Name: "suspend-db"}}}},
 		}},
@@ -342,7 +342,7 @@ func TestPolicySuspend(t *testing.T) {
 		got, _ := get(t, policy)
 		return got.Status.Message == "suspended"
 	}, timeout, 500*time.Millisecond)
-	require.NoError(t, k8s.Delete(t.Context(), &syncv1alpha1.ApplicationSync{ObjectMeta: metav1.ObjectMeta{Name: first, Namespace: namespace}}))
+	require.NoError(t, k8s.Delete(t.Context(), &syncv1alpha1.ApplicationSync{Name: first, Namespace: namespace}))
 	assert.Never(t, func() bool {
 		var list syncv1alpha1.ApplicationSyncList
 		if err := k8s.List(t.Context(), &list, client.InNamespace(namespace), client.MatchingLabels{"argocd.argoproj.io/application-sync-policy": policy.Name}); err != nil {

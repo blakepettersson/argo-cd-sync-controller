@@ -96,10 +96,8 @@ Argo CD's application controller completing an operation; `testApp` builds an ap
 
 ## Dependencies
 
-- Pinned to Argo CD v3.5.3 for its API types. `go.mod` must repeat Argo CD's `replace` directives (they don't
-  propagate to importers) — keep them in step when bumping Argo CD.
-- `third_party/gitops-engine` is a vendored copy of that release's `gitops-engine` directory (without tests),
-  wired in via `replace`, because its required pseudo-version can't be resolved outside Argo CD. Don't edit it;
-  replace it wholesale on upgrade (see `third_party/README.md`).
+- Pinned to Argo CD v3.6.0-rc3 for its API types. `go.mod` must repeat Argo CD's `replace` directives (they don't
+  propagate to importers) — keep them in step when bumping Argo CD, except Argo CD's local `gitops-engine/v3`
+  replace: require the `gitops-engine/vX.Y.Z` tag matching the Argo CD release instead.
 - Because there is no repo-server access, revisions are passed to syncs as given — branches are not resolved to
   commits.

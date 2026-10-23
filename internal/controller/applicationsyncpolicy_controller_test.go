@@ -23,7 +23,7 @@ func ctrlRequest(obj client.Object) reconcile.Request {
 
 func newTestPolicy(concurrency syncv1alpha1.ApplicationSyncConcurrencyPolicy) *syncv1alpha1.ApplicationSyncPolicy {
 	return &syncv1alpha1.ApplicationSyncPolicy{
-		ObjectMeta: metav1.ObjectMeta{Name: "platform", Namespace: testNamespace, UID: "policy-uid"},
+		Name: "platform", Namespace: testNamespace, UID: "policy-uid",
 		Spec: syncv1alpha1.ApplicationSyncPolicySpec{
 			ConcurrencyPolicy: concurrency,
 			Template: syncv1alpha1.ApplicationSyncSpec{
@@ -217,8 +217,8 @@ func TestPolicySelfHealBackoff(t *testing.T) {
 	p := newTestPolicy("")
 	p.Spec.SelfHeal = true
 	params := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Name: argoCDCmdParamsMap, Namespace: testNamespace},
-		Data:       map[string]string{selfHealBackoffTimeoutKey: "3600", selfHealBackoffFactorKey: "1", selfHealBackoffCapKey: "3600"},
+		Name: argoCDCmdParamsMap, Namespace: testNamespace,
+		Data: map[string]string{selfHealBackoffTimeoutKey: "3600", selfHealBackoffFactorKey: "1", selfHealBackoffCapKey: "3600"},
 	}
 	base := newTestReconciler(t, withApps([]client.Object{testProject(nil), p, params}, db, testApp("api"))...)
 	r := &ApplicationSyncPolicyReconciler{Client: base.Client, APIReader: base.APIReader, ArgoCDNamespace: testNamespace}

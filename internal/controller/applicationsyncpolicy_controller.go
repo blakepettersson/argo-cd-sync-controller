@@ -15,7 +15,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -73,7 +72,7 @@ func (r *ApplicationSyncPolicyReconciler) policiesForApp(ctx context.Context, ob
 	}
 	reqs := make([]reconcile.Request, 0, len(list.Items))
 	for _, p := range list.Items {
-		reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: p.Namespace, Name: p.Name}})
+		reqs = append(reqs, reconcile.Request{Namespace: p.Namespace, Name: p.Name})
 	}
 	return reqs
 }

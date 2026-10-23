@@ -14,7 +14,6 @@ import (
 	argov1alpha1 "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -46,7 +45,7 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 	_ = controller.Process.Kill()
 	_ = controller.Wait()
-	_ = k8s.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}})
+	_ = k8s.Delete(context.Background(), &corev1.Namespace{Name: namespace})
 	os.Exit(code)
 }
 
@@ -66,7 +65,7 @@ func setUp() error {
 		return err
 	}
 	ctx := context.Background()
-	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
+	ns := &corev1.Namespace{Name: namespace}
 	if err := client.IgnoreNotFound(k8s.Delete(ctx, ns)); err != nil {
 		return err
 	}
@@ -81,7 +80,7 @@ func setUp() error {
 		return err
 	}
 	return k8s.Create(ctx, &argov1alpha1.AppProject{
-		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: namespace},
+		Name: "default", Namespace: namespace,
 		Spec: argov1alpha1.AppProjectSpec{
 			SourceRepos:  []string{"*"},
 			Destinations: []argov1alpha1.ApplicationDestination{{Server: "*", Namespace: "*"}},

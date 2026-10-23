@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/argoproj/argo-cd/gitops-engine/pkg/health"
-	synccommon "github.com/argoproj/argo-cd/gitops-engine/pkg/sync/common"
+	"github.com/argoproj/argo-cd/gitops-engine/v3/pkg/health"
+	synccommon "github.com/argoproj/argo-cd/gitops-engine/v3/pkg/sync/common"
 	argov1alpha1 "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -40,7 +40,7 @@ func testScheme(t *testing.T) *runtime.Scheme {
 
 func testProject(windows argov1alpha1.SyncWindows) *argov1alpha1.AppProject {
 	return &argov1alpha1.AppProject{
-		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: testNamespace},
+		Name: "default", Namespace: testNamespace,
 		Spec: argov1alpha1.AppProjectSpec{
 			SourceRepos:  []string{"*"},
 			Destinations: []argov1alpha1.ApplicationDestination{{Server: "*", Namespace: "*"}},
@@ -52,7 +52,7 @@ func testProject(windows argov1alpha1.SyncWindows) *argov1alpha1.AppProject {
 // testApp is an app freshly compared against its current spec, OutOfSync.
 func testApp(name string) *argov1alpha1.Application {
 	app := &argov1alpha1.Application{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
+		Name: name, Namespace: testNamespace,
 		Spec: argov1alpha1.ApplicationSpec{
 			Project:     "default",
 			Source:      &argov1alpha1.ApplicationSource{RepoURL: "https://github.com/argoproj/argocd-example-apps.git", Path: "guestbook", TargetRevision: "HEAD"},
@@ -148,13 +148,11 @@ func group(name string, dependsOn []string, apps ...string) syncv1alpha1.Applica
 
 func newSync(groups ...syncv1alpha1.ApplicationSyncGroup) *syncv1alpha1.ApplicationSync {
 	return &syncv1alpha1.ApplicationSync{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:              "rollout",
-			Namespace:         testNamespace,
-			UID:               "rollout-uid",
-			CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Minute)),
-		},
-		Spec: syncv1alpha1.ApplicationSyncSpec{Groups: groups, Prune: true},
+		Name:              "rollout",
+		Namespace:         testNamespace,
+		UID:               "rollout-uid",
+		CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Minute)),
+		Spec:              syncv1alpha1.ApplicationSyncSpec{Groups: groups, Prune: true},
 	}
 }
 
@@ -538,7 +536,7 @@ func TestRevisions(t *testing.T) {
 		})
 	}
 	t.Run("override setting allows only targetRevision", func(t *testing.T) {
-		cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: argoCDConfigMap, Namespace: testNamespace}, Data: map[string]string{requireOverrideKey: "true"}}
+		cm := &corev1.ConfigMap{Name: argoCDConfigMap, Namespace: testNamespace, Data: map[string]string{requireOverrideKey: "true"}}
 		_, s := run(t, testApp("db"), []syncv1alpha1.ApplicationSyncRevision{{Revision: sha}}, cm)
 		assert.Contains(t, appStatus(t, s, "db").Message, "allows only targetRevision")
 
