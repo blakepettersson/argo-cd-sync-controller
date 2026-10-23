@@ -43,6 +43,9 @@ type ApplicationSyncPolicyReconciler struct {
 
 // +kubebuilder:rbac:groups=argoproj.io,resources=applicationsyncpolicies,verbs=get;list;watch
 // +kubebuilder:rbac:groups=argoproj.io,resources=applicationsyncpolicies/status,verbs=get;update;patch
+// Runs carry a blocking controller owner reference to their policy, which clusters enforcing owner reference
+// permissions only allow with update on the policy's finalizers.
+// +kubebuilder:rbac:groups=argoproj.io,resources=applicationsyncpolicies/finalizers,verbs=update
 // +kubebuilder:rbac:groups=argoproj.io,resources=applicationsyncs,verbs=get;list;watch;create;delete
 
 func (r *ApplicationSyncPolicyReconciler) argoCD() *argoCD {
