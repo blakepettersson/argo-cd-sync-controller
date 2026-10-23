@@ -11,7 +11,7 @@ make codegen-local        # deepcopy, CRDs (config/crd/bases) and ClusterRole (c
 make build-local          # dist/argo-cd-sync-controller
 make lint-local           # golangci-lint v2.13.2 with argo-cd's config, --fix
 make test-local           # go test -race -cover; TEST_MODULE=./internal/controller for one package
-make test-e2e-local       # builds, installs the CRDs, and runs test/e2e against the current kube context
+make test-e2e-local       # runs test/e2e against a throwaway k3s container (needs Docker), with the CRDs installed
 make pre-commit-local     # codegen, build, lint, test: must pass before committing
 
 go test -race ./internal/controller -run TestDependencyOrder   # single test

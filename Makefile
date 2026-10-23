@@ -41,7 +41,7 @@ test-local:
 	go test -race -cover $(TEST_MODULE)
 
 .PHONY: test-e2e-local
-test-e2e-local: build-local install ## Run the e2e suite against the current cluster
+test-e2e-local: ## Run the e2e suite against a k3s container (needs Docker)
 	E2E=true go test -race -count=1 -v ./test/e2e/...
 
 .PHONY: pre-commit-local

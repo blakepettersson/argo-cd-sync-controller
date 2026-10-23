@@ -129,7 +129,7 @@ make codegen-local        # deepcopy, CRDs and ClusterRole from the kubebuilder 
 make build-local
 make lint-local           # golangci-lint with Argo CD's config, applying fixes
 make test-local           # TEST_MODULE=./internal/controller for one package
-make test-e2e-local       # e2e suite against the current cluster, in its own namespace
+make test-e2e-local       # e2e suite against a throwaway k3s container; needs Docker
 make pre-commit-local     # all of the above; run it before committing
 ```
 
