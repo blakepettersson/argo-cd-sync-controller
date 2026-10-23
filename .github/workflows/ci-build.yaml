@@ -1,4 +1,4 @@
-# The Go jobs of argo-cd's ci-build.yaml: build, lint, unit tests and a check that generated code is committed.
+# The Go jobs of argo-cd's ci-build.yaml: build, lint, unit tests, e2e tests and a check that generated code is committed.
 # Action versions are pinned to the same SHAs as there.
 name: Integration tests
 on:
@@ -123,3 +123,33 @@ jobs:
         run: |
           set -xo pipefail
           git diff --exit-code -- . ':!go.sum' ':!go.mod' | tee codegen.patch
+
+  test-e2e:
+    name: Run end-to-end tests
+    runs-on: ubuntu-24.04
+    needs:
+      - build-go
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        if: ${{ vars.disable_harden_runner != 'true' }}
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Golang
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GOLANG_VERSION }}
+      - name: Run e2e tests against a k3s container
+        run: make test-e2e-local
+        timeout-minutes: 15
+      - name: Upload controller log
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-controller-log
+          path: dist/e2e-controller.log
+          if-no-files-found: ignore
