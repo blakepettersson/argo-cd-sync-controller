@@ -162,7 +162,7 @@ func setUp(ctx context.Context, cluster *k3s.K3sContainer, kubeconfig string) er
 }
 
 // installArgoCD runs the application controller and repo server of the Argo CD release in go.mod, from its
-// core-install.yaml. The images are pulled on the host and loaded into k3s, so a rerun doesn't download them again.
+// core-install.yaml.
 func installArgoCD(ctx context.Context, cluster *k3s.K3sContainer) error {
 	dir, err := argoCDDir()
 	if err != nil {
@@ -175,6 +175,34 @@ func installArgoCD(ctx context.Context, cluster *k3s.K3sContainer) error {
 	// ECR Public mirrors Docker Hub's official images, but limits anonymous downloads per IP, which shared CI runners
 	// exceed. Docker Hub has the same images, by digest.
 	manifest = bytes.ReplaceAll(manifest, []byte("public.ecr.aws/docker/library/"), []byte("docker.io/library/"))
+	// A CI runner starts with no images, so preloading would only keep a second copy of each on its disk.
+	if os.Getenv("CI") == "" {
+		if err := preloadImages(ctx, cluster, manifest); err != nil {
+			return err
+		}
+	}
+	if err := cluster.CopyToContainer(ctx, manifest, "/tmp/core-install.yaml", 0o644); err != nil {
+		return err
+	}
+	for _, args := range [][]string{
+		{"create", "namespace", argoCDNamespace},
+		// Applying the install keeps this data, which it doesn't set. A short reconciliation timeout without
+		// jitter makes Argo CD notice a new commit within seconds.
+		{"create", "configmap", "argocd-cm", "-n", argoCDNamespace, "--from-literal=timeout.reconciliation=5s", "--from-literal=timeout.reconciliation.jitter=0s"},
+		{"apply", "--server-side", "-n", argoCDNamespace, "-f", "/tmp/core-install.yaml"},
+		{"rollout", "status", "-n", argoCDNamespace, "deployment/argocd-repo-server", "--timeout=5m"},
+		{"rollout", "status", "-n", argoCDNamespace, "statefulset/argocd-application-controller", "--timeout=5m"},
+	} {
+		if err := kubectl(ctx, cluster, args...); err != nil {
+			return fmt.Errorf("%w\n%s", err, argoCDDiagnostics(ctx, cluster))
+		}
+	}
+	return nil
+}
+
+// preloadImages pulls the images manifest uses on the host and loads them into k3s, so a local rerun takes them from
+// the host's Docker instead of downloading them again into a new cluster.
+func preloadImages(ctx context.Context, cluster *k3s.K3sContainer, manifest []byte) error {
 	var images []string
 	for _, m := range regexp.MustCompile(`(?m)^\s+image: (\S+)$`).FindAllStringSubmatch(string(manifest), -1) {
 		if !slices.Contains(images, m[1]) {
@@ -199,29 +227,16 @@ func installArgoCD(ctx context.Context, cluster *k3s.K3sContainer) error {
 	if err := cluster.LoadImages(ctx, images...); err != nil {
 		return fmt.Errorf("loading images: %w", err)
 	}
-	if err := cluster.CopyToContainer(ctx, manifest, "/tmp/core-install.yaml", 0o644); err != nil {
-		return err
-	}
-	for _, args := range [][]string{
-		{"create", "namespace", argoCDNamespace},
-		// Applying the install keeps this data, which it doesn't set. A short reconciliation timeout without
-		// jitter makes Argo CD notice a new commit within seconds.
-		{"create", "configmap", "argocd-cm", "-n", argoCDNamespace, "--from-literal=timeout.reconciliation=5s", "--from-literal=timeout.reconciliation.jitter=0s"},
-		{"apply", "--server-side", "-n", argoCDNamespace, "-f", "/tmp/core-install.yaml"},
-		{"rollout", "status", "-n", argoCDNamespace, "deployment/argocd-repo-server", "--timeout=5m"},
-		{"rollout", "status", "-n", argoCDNamespace, "statefulset/argocd-application-controller", "--timeout=5m"},
-	} {
-		if err := kubectl(ctx, cluster, args...); err != nil {
-			return fmt.Errorf("%w\n%s", err, argoCDDiagnostics(ctx, cluster))
-		}
-	}
 	return nil
 }
 
-// argoCDDiagnostics describes Argo CD's pods, with their events and recent logs, for a failed install.
+// argoCDDiagnostics describes the node and Argo CD's pods, with the cluster's events and recent logs, for a failed
+// install.
 func argoCDDiagnostics(ctx context.Context, cluster *k3s.K3sContainer) string {
 	var b strings.Builder
 	for _, args := range [][]string{
+		{"describe", "nodes"},
+		{"get", "events", "--all-namespaces", "--sort-by=.lastTimestamp"},
 		{"get", "pods", "-n", argoCDNamespace, "-o", "wide"},
 		{"describe", "pods", "-n", argoCDNamespace},
 		{"logs", "-n", argoCDNamespace, "--all-containers", "--prefix", "--tail=50", "-l", "app.kubernetes.io/name"},
