@@ -212,10 +212,29 @@ func installArgoCD(ctx context.Context, cluster *k3s.K3sContainer) error {
 		{"rollout", "status", "-n", argoCDNamespace, "statefulset/argocd-application-controller", "--timeout=5m"},
 	} {
 		if err := kubectl(ctx, cluster, args...); err != nil {
-			return err
+			return fmt.Errorf("%w\n%s", err, argoCDDiagnostics(ctx, cluster))
 		}
 	}
 	return nil
+}
+
+// argoCDDiagnostics describes Argo CD's pods, with their events and recent logs, for a failed install.
+func argoCDDiagnostics(ctx context.Context, cluster *k3s.K3sContainer) string {
+	var b strings.Builder
+	for _, args := range [][]string{
+		{"get", "pods", "-n", argoCDNamespace, "-o", "wide"},
+		{"describe", "pods", "-n", argoCDNamespace},
+		{"logs", "-n", argoCDNamespace, "--all-containers", "--prefix", "--tail=50", "-l", "app.kubernetes.io/name"},
+	} {
+		_, out, err := cluster.Exec(ctx, append([]string{"kubectl"}, args...), tcexec.Multiplexed())
+		fmt.Fprintf(&b, "$ kubectl %s\n", strings.Join(args, " "))
+		if err != nil {
+			fmt.Fprintln(&b, err)
+			continue
+		}
+		_, _ = io.Copy(&b, out)
+	}
+	return b.String()
 }
 
 func kubectl(ctx context.Context, cluster *k3s.K3sContainer, args ...string) error {

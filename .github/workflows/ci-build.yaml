@@ -146,7 +146,8 @@ jobs:
           go-version: ${{ env.GOLANG_VERSION }}
       - name: Run e2e tests against a k3s container
         run: make test-e2e-local
-        timeout-minutes: 15
+        # As for argo-cd's e2e job; the race build and image pulls take several minutes on CI runners.
+        timeout-minutes: 30
       - name: Upload controller log
         if: ${{ failure() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
