@@ -5,6 +5,7 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -174,6 +175,9 @@ func installArgoCD(ctx context.Context, cluster *k3s.K3sContainer) error {
 	if err != nil {
 		return err
 	}
+	// ECR Public mirrors Docker Hub's official images, but limits anonymous downloads per IP, which shared CI runners
+	// exceed. Docker Hub has the same images, by digest.
+	manifest = bytes.ReplaceAll(manifest, []byte("public.ecr.aws/docker/library/"), []byte("docker.io/library/"))
 	var images []string
 	for _, m := range regexp.MustCompile(`(?m)^\s+image: (\S+)$`).FindAllStringSubmatch(string(manifest), -1) {
 		if !slices.Contains(images, m[1]) {
