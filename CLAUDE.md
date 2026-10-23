@@ -11,7 +11,7 @@ make codegen-local        # deepcopy, CRDs (config/crd/bases) and ClusterRole (c
 make build-local          # dist/argo-cd-sync-controller
 make lint-local           # golangci-lint v2.13.2 with argo-cd's config, --fix
 make test-local           # go test -race -cover; TEST_MODULE=./internal/controller for one package
-make test-e2e-local       # runs test/e2e against a throwaway k3s container (needs Docker), with the CRDs installed
+make test-e2e-local       # test/e2e in a throwaway k3s container with Argo CD (go.mod's release) installed; needs Docker and git
 make pre-commit-local     # codegen, build, lint, test: must pass before committing
 
 go test -race ./internal/controller -run TestDependencyOrder   # single test
@@ -93,6 +93,11 @@ matches its current spec and `reconciledAt` is after the operation (`isFresh`); 
 
 Tests use controller-runtime's fake client. `finishOperation` in `applicationsync_controller_test.go` simulates
 Argo CD's application controller completing an operation; `testApp` builds an app with fresh, OutOfSync status.
+
+`test/e2e` runs the controller against a k3s testcontainer with Argo CD's `core-install.yaml` (from the module in
+`go.mod`). `argocd_test.go` syncs real apps from a git repo the test process serves (`gitserver_test.go`);
+`applicationsync_test.go` uses a namespace Argo CD doesn't watch and plays its application controller, for states a
+real sync can't produce on demand. Each namespace has its own controller process, logging to `dist/e2e-controller-*.log`.
 
 ## Dependencies
 

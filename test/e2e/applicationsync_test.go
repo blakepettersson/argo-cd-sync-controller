@@ -291,7 +291,11 @@ func TestPolicyKeepsItsCurrentRunPastTTL(t *testing.T) {
 		return app.Operation != nil
 	}, timeout, 500*time.Millisecond)
 	syncedApp(t, "policy-db", argov1alpha1.SyncStatusCodeSynced, "rev1")
-	policy, _ = get(t, policy)
+	// The run can start its operation before the policy records it.
+	require.Eventually(t, func() bool {
+		policy, _ = get(t, policy)
+		return policy.Status.CurrentRun != ""
+	}, timeout, 500*time.Millisecond)
 	first := &syncv1alpha1.ApplicationSync{Name: policy.Status.CurrentRun, Namespace: namespace}
 	require.Eventually(t, func() bool {
 		first, _ = get(t, first)

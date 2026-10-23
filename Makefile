@@ -42,7 +42,7 @@ test-local:
 
 .PHONY: test-e2e-local
 test-e2e-local: ## Run the e2e suite against a k3s container (needs Docker)
-	E2E=true go test -race -count=1 -v ./test/e2e/...
+	E2E=true go test -race -count=1 -timeout=20m -v ./test/e2e/...
 
 .PHONY: pre-commit-local
 pre-commit-local: codegen-local build-local lint-local test-local
