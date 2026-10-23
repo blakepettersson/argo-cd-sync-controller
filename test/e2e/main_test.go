@@ -49,12 +49,9 @@ var (
 	repo *gitRepo
 )
 
+// TestMain starts the cluster, Argo CD and the controllers once for the package. It needs Docker and takes a few
+// minutes, so make test-local leaves this package out, as argo-cd's does; make test-e2e-local runs it.
 func TestMain(m *testing.M) {
-	// It needs Docker and takes a few minutes to start a cluster with Argo CD, so it only runs when asked to.
-	if os.Getenv("E2E") != "true" {
-		fmt.Println("skipping e2e tests; run make test-e2e-local, or set E2E=true")
-		os.Exit(0)
-	}
 	os.Exit(run(m))
 }
 

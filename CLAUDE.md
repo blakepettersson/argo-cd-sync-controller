@@ -10,7 +10,7 @@ Target names match argo-cd's Makefile; the non `-local` names (`build`, `lint`, 
 make codegen-local        # deepcopy, CRDs (config/crd/bases) and ClusterRole (config/rbac/role.yaml)
 make build-local          # dist/argo-cd-sync-controller
 make lint-local           # golangci-lint v2.13.2 with argo-cd's config, --fix
-make test-local           # go test -race -cover; TEST_MODULE=./internal/controller for one package
+make test-local           # go test -race -cover, except test/e2e; TEST_MODULE=./internal/controller for one package
 make test-e2e-local       # test/e2e in a throwaway k3s container with Argo CD (go.mod's release) installed; needs Docker and git
 make pre-commit-local     # codegen, build, lint, test: must pass before committing
 

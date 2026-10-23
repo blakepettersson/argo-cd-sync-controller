@@ -130,7 +130,7 @@ the same `make` target names, the same CI checks, and semantic PR titles (`feat:
 make codegen-local        # deepcopy, CRDs and ClusterRole from the kubebuilder markers
 make build-local
 make lint-local           # golangci-lint with Argo CD's config, applying fixes
-make test-local           # TEST_MODULE=./internal/controller for one package
+make test-local           # everything but test/e2e; TEST_MODULE=./internal/controller for one package
 make test-e2e-local       # e2e suite against Argo CD in a throwaway k3s container; needs Docker and git
 make pre-commit-local     # all of the above; run it before committing
 ```

@@ -10,7 +10,8 @@ IMAGE ?= ghcr.io/blakepettersson/argo-cd-sync-controller:latest
 
 # The Argo CD release this controller builds against, which start-test-k8s installs.
 ARGOCD_VERSION ?= $(shell go list -m -f '{{.Version}}' github.com/argoproj/argo-cd/v3)
-TEST_MODULE ?= ./...
+# Packages test-local runs: every one except the e2e suite, as in argo-cd.
+TEST_MODULE ?= $(shell go list ./... | grep -v 'test/e2e')
 # Procfile processes for start-local; empty starts them all.
 START ?=
 
@@ -49,7 +50,7 @@ test-local:
 
 .PHONY: test-e2e-local
 test-e2e-local: ## Run the e2e suite against a k3s container (needs Docker)
-	E2E=true go test -race -count=1 -timeout=20m -v ./test/e2e/...
+	go test -race -count=1 -timeout=20m -v ./test/e2e/...
 
 .PHONY: pre-commit-local
 pre-commit-local: codegen-local build-local lint-local test-local
