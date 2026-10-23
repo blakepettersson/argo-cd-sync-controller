@@ -308,6 +308,15 @@ func TestEmptyGroupsAndInvalidSpec(t *testing.T) {
 	reconcileSync(t, r, s)
 	assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseFailed, s.Status.Phase)
 	assert.Contains(t, s.Status.Message, `group "a" depends on "missing"`)
+
+	for _, v := range []intstr.IntOrString{intstr.FromString("2"), intstr.FromString("1.5%"), intstr.FromString("-5%"), intstr.FromString("00%"), intstr.FromInt32(0)} {
+		g := group("a", nil, "db")
+		g.MaxParallel = &v
+		s = newSync(g)
+		reconcileSync(t, r, s)
+		assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseFailed, s.Status.Phase, v.String())
+		assert.Contains(t, s.Status.Message, `maxParallel "`+v.String()+`" is not a number or a percentage of at least 1`)
+	}
 }
 
 func TestWaits(t *testing.T) {
@@ -444,7 +453,6 @@ func TestMaxParallel(t *testing.T) {
 	}{
 		{intstr.FromInt32(1), 1, "waiting for one of 1 parallel slots"},
 		{intstr.FromString("10%"), 1, "waiting for one of 1 parallel slots"},
-		{intstr.FromInt32(0), 1, "waiting for one of 1 parallel slots"}, // rejected by the CRD; never a hold
 	} {
 		t.Run(tc.maxParallel.String(), func(t *testing.T) {
 			r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, testApp("a"), testApp("b"))...)
@@ -817,6 +825,17 @@ func TestDeletedApplication(t *testing.T) {
 		require.NoError(t, live.Get(t.Context(), client.ObjectKeyFromObject(recreated), &got))
 		assert.Nil(t, got.Operation)
 	})
+	t.Run("deleted while the cache still holds it waits, without onFailure: Wait", func(t *testing.T) {
+		db, api := newApps()
+		r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, db, api)...)
+		s := newSync(group("data", nil, "db"))
+		r.APIReader = fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(s.DeepCopy()).Build()
+		reconcileSync(t, r, s)
+
+		st := appStatus(t, s, "db")
+		assert.Equal(t, syncv1alpha1.ApplicationSyncPhasePending, st.Phase)
+		assert.Equal(t, waitingForAppMessage, st.Message)
+	})
 	t.Run("a finished app keeps its phase", func(t *testing.T) {
 		db, api := newApps()
 		r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, db, api)...)
@@ -829,6 +848,47 @@ func TestDeletedApplication(t *testing.T) {
 		require.NoError(t, r.Delete(t.Context(), getTestApp(t, r.Client, "db")))
 		reconcileSync(t, r, s)
 		assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseSucceeded, appStatus(t, s, "db").Phase)
+	})
+}
+
+// A pass that set the operation but failed to record the Running phase is retried before the cache has the
+// operation; the retry must recognise its own operation on the live app instead of starting another.
+func TestRetriedStartAdoptsItsOwnOperation(t *testing.T) {
+	setUp := func(t *testing.T, finished bool) (*ApplicationSyncReconciler, *syncv1alpha1.ApplicationSync, client.Client) {
+		t.Helper()
+		db := testApp("db")
+		db.UID = "db-uid"
+		r := newTestReconciler(t, testProject(nil), db)
+		s := newSync(group("data", nil, "db"))
+		retried := s.DeepCopy()
+		reconcileSync(t, r, s)
+		require.Equal(t, syncv1alpha1.ApplicationSyncPhaseRunning, appStatus(t, s, "db").Phase)
+		if finished {
+			finishOperation(t, r.Client, "db", synccommon.OperationSucceeded, health.HealthStatusHealthy)
+		}
+		live := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(getTestApp(t, r.Client, "db"), s.DeepCopy()).Build()
+		r.APIReader = live
+		// The cache still has the app as it was before the operation was set.
+		updateTestApp(t, r.Client, "db", func(app *argov1alpha1.Application) {
+			app.Operation = nil
+			app.Status.OperationState = nil
+		})
+		return r, retried, live
+	}
+
+	t.Run("operation still running", func(t *testing.T) {
+		r, s, _ := setUp(t, false)
+		reconcileSync(t, r, s)
+		assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseRunning, appStatus(t, s, "db").Phase)
+	})
+	t.Run("operation already finished", func(t *testing.T) {
+		r, s, live := setUp(t, true)
+		reconcileSync(t, r, s)
+		assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseRunning, appStatus(t, s, "db").Phase)
+		var got argov1alpha1.Application
+		require.NoError(t, live.Get(t.Context(), types.NamespacedName{Namespace: testNamespace, Name: "db"}, &got))
+		assert.Nil(t, got.Operation, "no second operation is started")
+		assert.NotNil(t, got.Status.OperationState, "the first result is kept")
 	})
 }
 

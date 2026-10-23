@@ -68,7 +68,10 @@ func main() {
 	if namespaces != "" {
 		cacheOpts.DefaultNamespaces = map[string]cache.Config{argoCDNamespace: {}}
 		for ns := range strings.SplitSeq(namespaces, ",") {
-			cacheOpts.DefaultNamespaces[strings.TrimSpace(ns)] = cache.Config{}
+			// An empty name would mean every namespace.
+			if ns = strings.TrimSpace(ns); ns != "" {
+				cacheOpts.DefaultNamespaces[ns] = cache.Config{}
+			}
 		}
 	}
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{

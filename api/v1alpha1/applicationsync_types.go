@@ -69,7 +69,8 @@ type ApplicationSyncSpec struct {
 	// +kubebuilder:validation:Minimum=0
 	TTLSecondsAfterFinished *int32 `json:"ttlSecondsAfterFinished,omitempty"`
 	// ActiveDeadlineSeconds fails the run this many seconds after it started, as for a Job: every app that hasn't
-	// finished fails, operations already running finish, and nothing new starts.
+	// finished fails, apps in groups that haven't started are Skipped, operations already running finish, and nothing
+	// new starts.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=2147483647
 	ActiveDeadlineSeconds *int64 `json:"activeDeadlineSeconds,omitempty"`

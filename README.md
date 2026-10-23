@@ -62,7 +62,8 @@ under `status.groups`.
   policy runs always wait for it. An app deleted, or recreated under the same name, after its sync started
   fails, even with `onFailure: Wait`.
 - **Deadline.** `spec.activeDeadlineSeconds` fails a run that hasn't finished that long after it started, as for a
-  Job: unfinished apps fail, running operations finish, and nothing new starts.
+  Job: unfinished apps fail, apps in groups that haven't started are Skipped, running operations finish, and nothing
+  new starts.
 - **Health gate.** An app is done once its sync succeeded and it is Synced and Healthy. That status is only
   trusted once `status.sync.comparedTo` shows the app's current spec, and the controller requests a refresh
   when it doesn't.

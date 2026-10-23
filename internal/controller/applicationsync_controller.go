@@ -369,7 +369,8 @@ func groupLimit(maxParallel *intstr.IntOrString, total int) int {
 	}
 	limit, err := intstr.GetScaledValueFromIntOrPercent(maxParallel, total, false)
 	if err != nil {
-		return -1
+		// groupOrder rejects these; fail closed if one gets through.
+		return 1
 	}
 	return max(limit, 1)
 }
@@ -390,8 +391,11 @@ func (r *ApplicationSyncReconciler) reconcileApp(ctx context.Context, s *syncv1a
 	switch st.Phase {
 	case syncv1alpha1.ApplicationSyncPhasePending:
 		app, err := argo.getApp(ctx, s.Namespace, st.Name)
-		if err != nil {
+		if apierrors.IsNotFound(err) {
 			st.Message = waitingForAppMessage
+			return
+		} else if err != nil {
+			st.Message = err.Error()
 			return
 		}
 		if len(spec.Revisions) > 0 && st.PinnedRevisions == nil {
@@ -447,6 +451,11 @@ func (r *ApplicationSyncReconciler) reconcileApp(ctx context.Context, s *syncv1a
 		}
 		err = r.startOperation(ctx, s, spec, st, app)
 		if errors.Is(err, errApplicationSyncGone) {
+			return
+		}
+		if apierrors.IsNotFound(err) {
+			// The cache hasn't caught up with a deleted app; a missing app waits before its sync starts.
+			st.Message = waitingForAppMessage
 			return
 		}
 		if errors.Is(err, errApplicationReplaced) {
@@ -714,7 +723,9 @@ func (r *ApplicationSyncReconciler) startOperation(ctx context.Context, s *syncv
 	if live.UID != s.UID || live.DeletionTimestamp != nil {
 		return errApplicationSyncGone
 	}
-	if err := argo.setOperation(ctx, app.Namespace, app.Name, app.UID, &op); err != nil {
+	if err := argo.setOperation(ctx, s, app.Namespace, app.Name, app.UID, &op); errors.Is(err, errOperationAlreadySet) {
+		return nil
+	} else if err != nil {
 		return err
 	}
 	if r.Recorder != nil {

@@ -12,6 +12,7 @@ import (
 	argov1alpha1 "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -20,7 +21,7 @@ import (
 )
 
 // groupOrder returns indexes into groups in dependency order, or an error if dependsOn names an unknown group,
-// the dependencies form a cycle, or an app is listed in more than one group.
+// the dependencies form a cycle, an app is listed in more than one group, or maxParallel is below 1 or 1%.
 func groupOrder(groups []syncv1alpha1.ApplicationSyncGroup) ([]int, error) {
 	index := make(map[string]int, len(groups))
 	appGroup := map[string]string{}
@@ -29,6 +30,13 @@ func groupOrder(groups []syncv1alpha1.ApplicationSyncGroup) ([]int, error) {
 			return nil, fmt.Errorf("group %q is listed more than once", g.Name)
 		}
 		index[g.Name] = i
+		// The CRD can't check the string form without exceeding its CEL cost budget.
+		if g.MaxParallel != nil {
+			// Scaled against 100, a percentage is its own value.
+			if v, err := intstr.GetScaledValueFromIntOrPercent(g.MaxParallel, 100, false); err != nil || v < 1 {
+				return nil, fmt.Errorf("group %q: maxParallel %q is not a number or a percentage of at least 1", g.Name, g.MaxParallel.String())
+			}
+		}
 		for _, a := range g.Apps {
 			if other, ok := appGroup[a.Name]; ok {
 				return nil, fmt.Errorf("application %q is listed in groups %q and %q", a.Name, other, g.Name)
@@ -280,10 +288,10 @@ func (r *ApplicationSyncReconciler) expire(ctx context.Context, s *syncv1alpha1.
 // isPolicyCurrentRun reports whether s is the latest run of the policy that owns it, which neither the history
 // limit nor a TTL deletes, because the policy's same-change and self-heal checks read it.
 func (r *ApplicationSyncReconciler) isPolicyCurrentRun(ctx context.Context, s *syncv1alpha1.ApplicationSync) (bool, error) {
-	owner := metav1.GetControllerOf(s)
-	if owner == nil || owner.Kind != "ApplicationSyncPolicy" || owner.APIVersion != syncv1alpha1.GroupVersion.String() {
+	if !isAutomated(s) {
 		return false, nil
 	}
+	owner := metav1.GetControllerOf(s)
 	var p syncv1alpha1.ApplicationSyncPolicy
 	err := r.Get(ctx, client.ObjectKey{Namespace: s.Namespace, Name: owner.Name}, &p)
 	if err != nil {

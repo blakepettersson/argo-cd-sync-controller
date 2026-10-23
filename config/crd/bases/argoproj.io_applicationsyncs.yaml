@@ -59,7 +59,8 @@ spec:
               activeDeadlineSeconds:
                 description: |-
                   ActiveDeadlineSeconds fails the run this many seconds after it started, as for a Job: every app that hasn't
-                  finished fails, operations already running finish, and nothing new starts.
+                  finished fails, apps in groups that haven't started are Skipped, operations already running finish, and nothing
+                  new starts.
                 format: int64
                 maximum: 2147483647
                 minimum: 1

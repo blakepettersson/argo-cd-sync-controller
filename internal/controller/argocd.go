@@ -15,6 +15,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	syncv1alpha1 "github.com/argoproj-labs/argo-cd-sync-controller/api/v1alpha1"
 )
 
 // This file holds what the controller needs from Argo CD, reached only through the Kubernetes API.
@@ -46,6 +48,9 @@ var errAnotherOperationInProgress = errors.New("another operation is already in 
 
 // errApplicationReplaced means the live app is a newer one than the cached copy the checks ran against.
 var errApplicationReplaced = errors.New("application was replaced")
+
+// errOperationAlreadySet means the live app already has this run's operation, or its result, from an earlier pass.
+var errOperationAlreadySet = errors.New("operation already set")
 
 // errApplicationSyncGone is returned when the ApplicationSync was deleted, or replaced by a same-named one, since it
 // was read from the cache.
@@ -156,10 +161,11 @@ func (a *argoCD) replaceAllowed(ctx context.Context) (bool, error) {
 	return a.boolSetting(ctx, argoCDCmdParamsMap, replaceAllowedKey, true)
 }
 
-// setOperation writes op on the live app, as the Sync API does: it fails if an operation is already set, and
+// setOperation writes s's op on the live app, as the Sync API does: it fails if an operation is already set, and
 // clears the previous operationState in the same update. It also fails if the live app isn't the one with uid that
-// the caller checked.
-func (a *argoCD) setOperation(ctx context.Context, namespace, name string, uid types.UID, op *argov1alpha1.Operation) error {
+// the caller checked. If the live app already has s's operation, or its result, from a pass whose status update
+// failed, it returns errOperationAlreadySet.
+func (a *argoCD) setOperation(ctx context.Context, s *syncv1alpha1.ApplicationSync, namespace, name string, uid types.UID, op *argov1alpha1.Operation) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		app, err := a.getLiveApp(ctx, namespace, name)
 		if err != nil {
@@ -167,6 +173,9 @@ func (a *argoCD) setOperation(ctx context.Context, namespace, name string, uid t
 		}
 		if app.UID != uid {
 			return errApplicationReplaced
+		}
+		if isOperationFor(s, app.Operation) || operationStateFor(s, app) != nil {
+			return errOperationAlreadySet
 		}
 		if app.Operation != nil {
 			return errAnotherOperationInProgress
