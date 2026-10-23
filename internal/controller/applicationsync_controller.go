@@ -456,7 +456,13 @@ func (r *ApplicationSyncReconciler) reconcileApp(ctx context.Context, s *syncv1a
 			return
 		}
 		if errors.Is(err, errAnotherOperationInProgress) {
-			st.Message = "waiting for another operation to finish"
+			// As the Sync API does, a busy app is a failed start, so onFailure decides whether to wait. A policy
+			// doesn't retry a failed change, so its runs always wait.
+			if isAutomated(s) {
+				st.Message = "waiting for another operation to finish"
+				return
+			}
+			fail(err.Error())
 			return
 		}
 		if err != nil {

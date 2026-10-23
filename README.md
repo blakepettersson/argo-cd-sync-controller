@@ -57,8 +57,9 @@ under `status.groups`.
   synced, and a policy starts no run while any of its apps has it on. To keep a group of apps in sync
   automatically, use an ApplicationSyncPolicy instead, with `selfHeal` if drift should be reverted. Nothing is
   read from an app's own `syncPolicy.automated`.
-- **Waiting.** An app that doesn't exist yet, or already has an operation running, waits; the run's message and a
-  `ApplicationWaiting` event say why. An app deleted, or recreated under the same name, after its sync started
+- **Waiting.** An app that doesn't exist yet waits; the run's message and an `ApplicationWaiting` event say why. An
+  app that already has an operation running fails, as the Sync API rejects it, unless `onFailure: Wait` is set;
+  policy runs always wait for it. An app deleted, or recreated under the same name, after its sync started
   fails, even with `onFailure: Wait`.
 - **Deadline.** `spec.activeDeadlineSeconds` fails a run that hasn't finished that long after it started, as for a
   Job: unfinished apps fail, running operations finish, and nothing new starts.

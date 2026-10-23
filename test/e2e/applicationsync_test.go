@@ -219,6 +219,24 @@ func TestDeletedApplication(t *testing.T) {
 	})
 }
 
+func TestBusyApplicationFailsAsTheSyncAPIRejects(t *testing.T) {
+	app := createApp(t, "busy")
+	require.NoError(t, retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		got, _ := get(t, app)
+		got.Operation = &argov1alpha1.Operation{Sync: &argov1alpha1.SyncOperation{}}
+		return k8s.Update(t.Context(), got)
+	}))
+	s := createSync(t, "busy-app", syncv1alpha1.ApplicationSyncSpec{
+		Groups: []syncv1alpha1.ApplicationSyncGroup{{Name: "default", Apps: []syncv1alpha1.ApplicationSyncApp{{Name: app.Name}}}},
+	})
+	require.Eventually(t, func() bool {
+		got, _ := get(t, s)
+		return got.Status.Phase == syncv1alpha1.ApplicationSyncPhaseFailed
+	}, timeout, 500*time.Millisecond)
+	s, _ = get(t, s)
+	assert.Equal(t, "another operation is already in progress", appEntry(s, app.Name).Message)
+}
+
 func TestActiveDeadlineSeconds(t *testing.T) {
 	deadline := int64(3)
 	s := createSync(t, "deadline", syncv1alpha1.ApplicationSyncSpec{

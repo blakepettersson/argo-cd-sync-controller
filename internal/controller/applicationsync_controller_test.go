@@ -314,12 +314,31 @@ func TestEmptyGroupsAndInvalidSpec(t *testing.T) {
 
 func TestWaits(t *testing.T) {
 	t.Run("busy app", func(t *testing.T) {
-		app := testApp("db")
-		app.Operation = &argov1alpha1.Operation{Sync: &argov1alpha1.SyncOperation{}}
-		r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, app)...)
-		s := newSync(group("data", nil, "db"))
-		reconcileSync(t, r, s)
-		assert.Equal(t, "waiting for another operation to finish", appStatus(t, s, "db").Message)
+		for _, tc := range []struct {
+			name    string
+			mutate  func(*syncv1alpha1.ApplicationSync)
+			phase   syncv1alpha1.ApplicationSyncPhase
+			message string
+		}{
+			{"fails, as the Sync API rejects", func(*syncv1alpha1.ApplicationSync) {}, syncv1alpha1.ApplicationSyncPhaseFailed, "another operation is already in progress"},
+			{
+				"waits with onFailure: Wait", func(s *syncv1alpha1.ApplicationSync) { s.Spec.OnFailure = syncv1alpha1.ApplicationSyncOnFailureWait },
+				syncv1alpha1.ApplicationSyncPhasePending, "another operation is already in progress" + waitingToRecoverSuffix,
+			},
+			{"waits in a policy run", ownByPolicy, syncv1alpha1.ApplicationSyncPhasePending, "waiting for another operation to finish"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				app := testApp("db")
+				app.Operation = &argov1alpha1.Operation{Sync: &argov1alpha1.SyncOperation{}}
+				r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, app)...)
+				s := newSync(group("data", nil, "db"))
+				tc.mutate(s)
+				reconcileSync(t, r, s)
+				st := appStatus(t, s, "db")
+				assert.Equal(t, tc.phase, st.Phase)
+				assert.Equal(t, tc.message, st.Message)
+			})
+		}
 	})
 	t.Run("missing app", func(t *testing.T) {
 		r := newTestReconciler(t, testProject(nil))
