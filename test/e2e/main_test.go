@@ -13,8 +13,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -175,12 +173,6 @@ func installArgoCD(ctx context.Context, cluster *k3s.K3sContainer) error {
 	// ECR Public mirrors Docker Hub's official images, but limits anonymous downloads per IP, which shared CI runners
 	// exceed. Docker Hub has the same images, by digest.
 	manifest = bytes.ReplaceAll(manifest, []byte("public.ecr.aws/docker/library/"), []byte("docker.io/library/"))
-	// A CI runner starts with no images, so preloading would only keep a second copy of each on its disk.
-	if os.Getenv("CI") == "" {
-		if err := preloadImages(ctx, cluster, manifest); err != nil {
-			return err
-		}
-	}
 	if err := cluster.CopyToContainer(ctx, manifest, "/tmp/core-install.yaml", 0o644); err != nil {
 		return err
 	}
@@ -196,36 +188,6 @@ func installArgoCD(ctx context.Context, cluster *k3s.K3sContainer) error {
 		if err := kubectl(ctx, cluster, args...); err != nil {
 			return fmt.Errorf("%w\n%s", err, argoCDDiagnostics(ctx, cluster))
 		}
-	}
-	return nil
-}
-
-// preloadImages pulls the images manifest uses on the host and loads them into k3s, so a local rerun takes them from
-// the host's Docker instead of downloading them again into a new cluster.
-func preloadImages(ctx context.Context, cluster *k3s.K3sContainer, manifest []byte) error {
-	var images []string
-	for _, m := range regexp.MustCompile(`(?m)^\s+image: (\S+)$`).FindAllStringSubmatch(string(manifest), -1) {
-		if !slices.Contains(images, m[1]) {
-			images = append(images, m[1])
-		}
-	}
-	provider, err := testcontainers.NewDockerProvider()
-	if err != nil {
-		return err
-	}
-	defer provider.Close()
-	for _, image := range images {
-		if err := provider.PullImage(ctx, image); err != nil {
-			return err
-		}
-		// PullImage returns nil when the pull fails partway through, reporting the error in its stream:
-		// https://github.com/testcontainers/testcontainers-go/issues/3945
-		if _, err := provider.Client().ImageInspect(ctx, image); err != nil {
-			return fmt.Errorf("pulling %s: %w", image, err)
-		}
-	}
-	if err := cluster.LoadImages(ctx, images...); err != nil {
-		return fmt.Errorf("loading images: %w", err)
 	}
 	return nil
 }
