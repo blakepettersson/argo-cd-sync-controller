@@ -5,6 +5,9 @@ CONTROLLER_GEN ?= go run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.18.0
 # The golangci-lint version argo-cd's CI uses.
 GOLANGCI_LINT ?= go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
 
+# The image make image builds; the release workflow pushes it to ghcr.io on a version tag.
+IMAGE ?= ghcr.io/blakepettersson/argo-cd-sync-controller:latest
+
 # The Argo CD release this controller builds against, which start-test-k8s installs.
 ARGOCD_VERSION ?= $(shell go list -m -f '{{.Version}}' github.com/argoproj/argo-cd/v3)
 TEST_MODULE ?= ./...
@@ -29,6 +32,10 @@ codegen-local: generate manifests
 .PHONY: build-local
 build-local:
 	go build -o dist/argo-cd-sync-controller ./cmd
+
+.PHONY: image
+image: ## Build the controller image
+	docker build -t $(IMAGE) .
 
 .PHONY: lint-local
 lint-local:

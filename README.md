@@ -118,7 +118,8 @@ A prototype of this ran inside Argo CD's application controller. Running outside
 kubectl apply --server-side -k config/default   # into the argocd namespace
 ```
 
-The image in `config/manager` is a placeholder until the project publishes images.
+This installs `ghcr.io/blakepettersson/argo-cd-sync-controller:latest`, the newest release. Each `v*` tag is
+published there as an image for `linux/amd64` and `linux/arm64`; `make image` builds one locally.
 
 ## Development
 
