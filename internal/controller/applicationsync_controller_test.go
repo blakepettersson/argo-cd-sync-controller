@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/argoproj/argo-cd/gitops-engine/v3/pkg/health"
 	synccommon "github.com/argoproj/argo-cd/gitops-engine/v3/pkg/sync/common"
 	argov1alpha1 "github.com/argoproj/argo-cd/v3/pkg/apis/application/v1alpha1"
+	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
@@ -23,6 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	syncv1alpha1 "github.com/argoproj-labs/argo-cd-sync-controller/api/v1alpha1"
 )
@@ -1019,6 +1022,30 @@ func TestGarbageCollectionBreaksTiesByCreation(t *testing.T) {
 	require.NoError(t, r.List(t.Context(), &list))
 	require.Len(t, list.Items, 1)
 	assert.Equal(t, "a-newer", list.Items[0].Name)
+}
+
+func TestGarbageCollectionLogsListFailure(t *testing.T) {
+	finished := metav1.NewTime(time.Now().Add(-time.Minute))
+	old := newSync(group("all", nil, "db"))
+	old.Name = "old"
+	old.Status.Phase = syncv1alpha1.ApplicationSyncPhaseSucceeded
+	old.Status.FinishedAt = &finished
+	current := old.DeepCopy()
+	current.Name = "current"
+	r := newTestReconciler(t, old, current)
+	r.HistoryLimit = 1
+	live := r.Client
+	r.Client = interceptor.NewClient(live.(client.WithWatch), interceptor.Funcs{List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
+		return errors.New("apiserver unavailable")
+	}})
+	sink := &recordingSink{}
+
+	r.gc(log.IntoContext(t.Context(), logr.New(sink)), current)
+
+	assert.Equal(t, []string{"listing ApplicationSyncs to garbage collect"}, sink.errors, "gc only runs when a sync completes, so a failure isn't retried soon")
+	var list syncv1alpha1.ApplicationSyncList
+	require.NoError(t, live.List(t.Context(), &list))
+	assert.Len(t, list.Items, 2)
 }
 
 func TestWaitEvents(t *testing.T) {
