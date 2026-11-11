@@ -3,7 +3,7 @@
 
 CONTROLLER_GEN ?= go run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.18.0
 # The golangci-lint version argo-cd's CI uses.
-GOLANGCI_LINT ?= go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
+GOLANGCI_LINT ?= go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
 
 # The image make image builds; the release workflow pushes it to ghcr.io on a version tag.
 IMAGE ?= ghcr.io/blakepettersson/argo-cd-sync-controller:latest
