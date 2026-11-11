@@ -31,8 +31,13 @@ const (
 	selfHealBackoffTimeoutKey = "controller.self.heal.backoff.timeout.seconds"
 	selfHealBackoffFactorKey  = "controller.self.heal.backoff.factor"
 	selfHealBackoffCapKey     = "controller.self.heal.backoff.cap.seconds"
-	refreshAnnotation         = "argocd.argoproj.io/refresh"
-	operationStartedEvent     = "OperationStarted"
+	// Defaults for those settings, matching argocd-application-controller's flag defaults.
+	defaultSelfHealTimeoutSeconds        = 0
+	defaultSelfHealBackoffTimeoutSeconds = 2
+	defaultSelfHealBackoffFactor         = 3
+	defaultSelfHealBackoffCapSeconds     = 300
+	refreshAnnotation                    = "argocd.argoproj.io/refresh"
+	operationStartedEvent                = "OperationStarted"
 )
 
 // errAutoSyncEnabled is why an app with Argo CD auto-sync on is never synced: both controllers would sync it.
@@ -129,10 +134,10 @@ func (a *argoCD) selfHealDelay(ctx context.Context, finishedAt *metav1.Time, att
 	}
 	var errs [4]error
 	var timeout, backoffTimeout, factor, backoffCap int
-	timeout, errs[0] = seconds(selfHealTimeoutKey, 0)
-	backoffTimeout, errs[1] = seconds(selfHealBackoffTimeoutKey, 2)
-	factor, errs[2] = seconds(selfHealBackoffFactorKey, 3)
-	backoffCap, errs[3] = seconds(selfHealBackoffCapKey, 300)
+	timeout, errs[0] = seconds(selfHealTimeoutKey, defaultSelfHealTimeoutSeconds)
+	backoffTimeout, errs[1] = seconds(selfHealBackoffTimeoutKey, defaultSelfHealBackoffTimeoutSeconds)
+	factor, errs[2] = seconds(selfHealBackoffFactorKey, defaultSelfHealBackoffFactor)
+	backoffCap, errs[3] = seconds(selfHealBackoffCapKey, defaultSelfHealBackoffCapSeconds)
 	if err := errors.Join(errs[:]...); err != nil {
 		return 0, fmt.Errorf("reading self-heal settings from %s: %w", argoCDCmdParamsMap, err)
 	}
