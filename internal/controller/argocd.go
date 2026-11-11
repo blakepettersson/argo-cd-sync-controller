@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	syncv1alpha1 "github.com/argoproj-labs/argo-cd-sync-controller/api/v1alpha1"
 )
@@ -186,10 +187,11 @@ func (a *argoCD) setOperation(ctx context.Context, s *syncv1alpha1.ApplicationSy
 	})
 }
 
-// requestRefresh asks the application controller to refresh app, the way the CLI and ApplicationSets do.
-func (a *argoCD) requestRefresh(ctx context.Context, app *argov1alpha1.Application) error {
+// requestRefresh asks the application controller to refresh app, the way the CLI and ApplicationSets do. Callers
+// wait for fresh status and ask again on their next reconcile, so a failure is only logged, at info level.
+func (a *argoCD) requestRefresh(ctx context.Context, app *argov1alpha1.Application) {
 	if app.Annotations[refreshAnnotation] != "" {
-		return nil
+		return
 	}
 	patch := client.MergeFrom(app.DeepCopy())
 	updated := app.DeepCopy()
@@ -197,7 +199,9 @@ func (a *argoCD) requestRefresh(ctx context.Context, app *argov1alpha1.Applicati
 		updated.Annotations = map[string]string{}
 	}
 	updated.Annotations[refreshAnnotation] = string(argov1alpha1.RefreshTypeNormal)
-	return a.client.Patch(ctx, updated, patch)
+	if err := a.client.Patch(ctx, updated, patch); err != nil {
+		log.FromContext(ctx).Info("requesting refresh failed, retrying on the next reconcile", "application", app.Name, "error", err)
+	}
 }
 
 // comparedToCurrentSpec reports whether the app's last comparison, recorded in status.sync.comparedTo, was

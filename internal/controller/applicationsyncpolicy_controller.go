@@ -19,7 +19,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	syncv1alpha1 "github.com/argoproj-labs/argo-cd-sync-controller/api/v1alpha1"
@@ -145,9 +144,7 @@ func (r *ApplicationSyncPolicyReconciler) reconcilePolicy(ctx context.Context, p
 		}
 		// Only act on status computed against the app's current spec.
 		if app.Status.ReconciledAt == nil || !comparedToCurrentSpec(app) {
-			if err := argo.requestRefresh(ctx, app); err != nil {
-				log.FromContext(ctx).Error(err, "requesting refresh", "application", name)
-			}
+			argo.requestRefresh(ctx, app)
 			p.Status.Message = fmt.Sprintf("waiting for application %q to be refreshed", name)
 			return 0, nil
 		}
