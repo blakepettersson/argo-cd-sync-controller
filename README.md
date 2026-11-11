@@ -152,5 +152,5 @@ run only the controller here with `make start-local START=controller`. The contr
 listen on `:18080` and `:18081`, so they don't clash with Argo CD's ports. `ARGOCD_APPLICATION_NAMESPACES` is
 passed to the controller's `--namespaces`, as for Argo CD.
 
-It depends on Argo CD v3.6.0-rc3 for its API types, and on the matching `gitops-engine/v3` release. `go.mod` repeats
+It depends on Argo CD v3.6.0 for its API types, and on the matching `gitops-engine/v3` release. `go.mod` repeats
 Argo CD's replace directives, which don't carry over to modules that import it.

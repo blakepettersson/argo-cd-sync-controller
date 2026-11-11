@@ -9,7 +9,7 @@ Target names match argo-cd's Makefile; the non `-local` names (`build`, `lint`, 
 ```bash
 make codegen-local        # deepcopy, CRDs (config/crd/bases) and ClusterRole (config/rbac/role.yaml)
 make build-local          # dist/argo-cd-sync-controller
-make lint-local           # golangci-lint v2.13.2 with argo-cd's config, --fix
+make lint-local           # golangci-lint v2.14.0 with argo-cd's config, --fix
 make test-local           # go test -race -cover, except test/e2e; TEST_MODULE=./internal/controller for one package
 make test-e2e-local       # test/e2e in a throwaway k3s container with Argo CD (go.mod's release) installed; needs Docker and git
 make pre-commit-local     # codegen, build, lint, test: must pass before committing
@@ -107,7 +107,7 @@ real sync can't produce on demand. Each namespace has its own controller process
 
 ## Dependencies
 
-- Pinned to Argo CD v3.6.0-rc3 for its API types. `go.mod` must repeat Argo CD's `replace` directives (they don't
+- Pinned to Argo CD v3.6.0 for its API types. `go.mod` must repeat Argo CD's `replace` directives (they don't
   propagate to importers) — keep them in step when bumping Argo CD, except Argo CD's local `gitops-engine/v3`
   replace: require the `gitops-engine/vX.Y.Z` tag matching the Argo CD release instead.
 - Because there is no repo-server access, revisions are passed to syncs as given — branches are not resolved to
