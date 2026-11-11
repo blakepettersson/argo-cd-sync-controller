@@ -21,8 +21,15 @@ make start-local          # goreman runs Procfile: controller + argocd-server po
 make start-local START=controller   # only the controller, e.g. next to argo-cd's own `make start-local`
 ```
 
-Run `make codegen-local` after changing anything in `api/v1alpha1` or any `+kubebuilder:rbac` marker; the
-generated files are committed, and CI fails if they are out of date.
+### After changing X, also do Y
+
+| You changed | Then |
+| --- | --- |
+| `api/v1alpha1` or a `+kubebuilder:rbac` marker | `make codegen-local` and commit the generated files (CI fails if they are stale) |
+| User-visible behavior | `README.md` |
+| The design | the proposal, `../argo-cd/docs/proposals/applicationsync.md` |
+| The Argo CD version in `go.mod` | repeat its `replace` directives and require the matching `gitops-engine/vX.Y.Z` tag (see Dependencies) |
+| `.golangci.yaml` or `.github/workflows` | keep them in step with `../argo-cd` |
 
 ## Standards
 
@@ -32,8 +39,7 @@ Until the code moves into argo-cd, it follows argo-cd's rules so the move needs 
   `../argo-cd/.golangci.yaml`, and don't relax it here. The workflows in `.github/workflows` mirror argo-cd's
   Go jobs and pin the same action SHAs and Go version.
 - Use semantic commit and PR titles: `feat:`, `fix:`, `docs:`, `test:`, `chore:`, `refactor:`, `ci:`, `revert:`.
-- Ship every behavior change or fix with unit tests. Update `README.md` for user-visible behavior, and the
-  proposal (`../argo-cd/docs/proposals/applicationsync.md`) when the design changes.
+- Ship every behavior change or fix with unit tests, plus the follow-ups in "After changing X, also do Y".
 
 ## What this is
 
@@ -106,3 +112,68 @@ real sync can't produce on demand. Each namespace has its own controller process
   replace: require the `gitops-engine/vX.Y.Z` tag matching the Argo CD release instead.
 - Because there is no repo-server access, revisions are passed to syncs as given — branches are not resolved to
   commits.
+
+## Go conventions
+
+- Use the modern standard library (`slices`, `maps`, `min`/`max`, `for i := range n`); argo-cd's `modernize`
+  linter flags most of the rest. It disables `newexpr`, so `ptr.To(v)` is fine.
+- Match errors with `errors.Is`/`errors.As`, never by string, and wrap with `fmt.Errorf("...: %w", err)`.
+- Give magic numbers a named constant with a comment explaining the value (like `resyncPeriod`).
+- Search for an existing helper (this package, argo-cd's `util`, controller-runtime) before writing one.
+- Log with `log.FromContext(ctx)`. Don't log at error level for failures that are retried and expected to succeed;
+  return the error or log at info/V-level.
+
+### Comments
+
+Comments are for a future reader who has only this repository (and the proposal).
+
+- Explain **why**, not what. State the invariant the code relies on.
+- Keep them short: one or two lines is usually enough. A comment longer than the code it explains is a smell.
+- No history ("previously this used X", "changed to fix Y"); that goes in the commit message. No references to
+  conversations or plans.
+- Update or delete comments the change made wrong. Don't delete existing "why" comments that are still true.
+
+## Testing
+
+- Tests must be able to fail: use distinct values per case, include negative cases, and exercise the production
+  code path rather than a shape production can't produce. With the fake client, `finishOperation` and `testApp`
+  build states by hand, so make sure they match what Argo CD's application controller actually writes.
+- Follow argo-cd's style: plain `func TestX(t *testing.T)` with testify's `require`/`assert`, table-driven where
+  it helps.
+- Larger features need an e2e test in `test/e2e`.
+
+### Running e2e tests
+
+`make test-e2e-local` starts a k3s container and installs Argo CD, so it takes a while. Run it in the background
+with output redirected to a file and read the file to check progress, rather than streaming it. If Docker or git
+is missing, tell the user rather than installing it. On failure, read the controller logs in
+`dist/e2e-controller-*.log`.
+
+## Compatibility
+
+The CRDs are `v1alpha1`, but people upgrade the controller with existing objects in their cluster.
+
+- Before tightening CEL/OpenAPI validation or changing a default, check what existing `ApplicationSync` and
+  `ApplicationSyncPolicy` objects look like; new rules must not break updates (e.g. finalizer removal) of them.
+- `status` written by an older controller must still be readable.
+- Bound list sizes a user controls (`maxItems` on groups and apps), which also keeps CEL rules within their cost
+  budget.
+
+## Pull requests
+
+- One feature or fix per PR. No drive-by refactors.
+- The description says what changed, why, and how it was verified (commands run). Keep it accurate as the code
+  changes during review.
+
+## Before you finish
+
+- [ ] `make pre-commit-local` passes
+- [ ] Every row of "After changing X, also do Y" that applies is done
+- [ ] New behavior and fixes have tests
+- [ ] Comments you added explain why and contain no history
+
+If a test fails in code you don't think you touched, keep going with the rest of the work, but tell the user and
+resolve it before calling the task done.
+
+When you finish a task that produced a diff, ask the user once, briefly, whether to run `/code-review`; don't run
+it automatically. Skip this for read-only work or if the user already declined in this session.
