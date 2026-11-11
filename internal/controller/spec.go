@@ -217,6 +217,7 @@ func (r *ApplicationSyncReconciler) gc(ctx context.Context, s *syncv1alpha1.Appl
 	}
 	var list syncv1alpha1.ApplicationSyncList
 	if err := r.List(ctx, &list, client.InNamespace(s.Namespace)); err != nil {
+		log.FromContext(ctx).Error(err, "listing ApplicationSyncs to garbage collect", "namespace", s.Namespace)
 		return
 	}
 	var completed []*syncv1alpha1.ApplicationSync
