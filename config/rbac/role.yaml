@@ -25,6 +25,12 @@ rules:
 - apiGroups:
   - argoproj.io
   resources:
+  - applicationsyncpolicies/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - argoproj.io
+  resources:
   - applicationsyncpolicies/status
   - applicationsyncs/status
   verbs:

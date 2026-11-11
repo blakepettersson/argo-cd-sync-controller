@@ -173,6 +173,10 @@ func installArgoCD(ctx context.Context, cluster *k3s.K3sContainer) error {
 	// ECR Public mirrors Docker Hub's official images, but limits anonymous downloads per IP, which shared CI runners
 	// exceed. Docker Hub has the same images, by digest.
 	manifest = bytes.ReplaceAll(manifest, []byte("public.ecr.aws/docker/library/"), []byte("docker.io/library/"))
+	health, err := os.ReadFile(filepath.Join("..", "..", "config", "argocd", "applicationsync-health.lua"))
+	if err != nil {
+		return err
+	}
 	if err := cluster.CopyToContainer(ctx, manifest, "/tmp/core-install.yaml", 0o644); err != nil {
 		return err
 	}
@@ -180,7 +184,11 @@ func installArgoCD(ctx context.Context, cluster *k3s.K3sContainer) error {
 		{"create", "namespace", argoCDNamespace},
 		// Applying the install keeps this data, which it doesn't set. A short reconciliation timeout without
 		// jitter makes Argo CD notice a new commit within seconds.
-		{"create", "configmap", "argocd-cm", "-n", argoCDNamespace, "--from-literal=timeout.reconciliation=5s", "--from-literal=timeout.reconciliation.jitter=0s"},
+		// The ApplicationSync health check lets a run committed as a sync hook hold its parent app's sync.
+		{
+			"create", "configmap", "argocd-cm", "-n", argoCDNamespace, "--from-literal=timeout.reconciliation=5s", "--from-literal=timeout.reconciliation.jitter=0s",
+			"--from-literal=resource.customizations.health.argoproj.io_ApplicationSync=" + string(health),
+		},
 		{"apply", "--server-side", "-n", argoCDNamespace, "-f", "/tmp/core-install.yaml"},
 		{"rollout", "status", "-n", argoCDNamespace, "deployment/argocd-repo-server", "--timeout=5m"},
 		{"rollout", "status", "-n", argoCDNamespace, "statefulset/argocd-application-controller", "--timeout=5m"},

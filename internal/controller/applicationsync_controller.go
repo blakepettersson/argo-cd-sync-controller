@@ -19,7 +19,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	syncv1alpha1 "github.com/argoproj-labs/argo-cd-sync-controller/api/v1alpha1"
@@ -588,9 +587,7 @@ func (r *ApplicationSyncReconciler) reconcileApp(ctx context.Context, s *syncv1a
 func (r *ApplicationSyncReconciler) isFresh(ctx context.Context, app *argov1alpha1.Application, since *metav1.Time) bool {
 	fresh := app.Status.ReconciledAt != nil && (since == nil || !app.Status.ReconciledAt.Before(since)) && comparedToCurrentSpec(app)
 	if !fresh {
-		if err := r.argoCD().requestRefresh(ctx, app); err != nil {
-			log.FromContext(ctx).Error(err, "requesting refresh", "application", app.Name)
-		}
+		r.argoCD().requestRefresh(ctx, app)
 	}
 	return fresh
 }
