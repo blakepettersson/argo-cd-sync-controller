@@ -1,11 +1,11 @@
 package controller
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"slices"
-	"sort"
 	"time"
 
 	"github.com/argoproj/argo-cd/gitops-engine/v3/pkg/utils/text"
@@ -225,17 +225,13 @@ func (r *ApplicationSyncReconciler) gc(ctx context.Context, s *syncv1alpha1.Appl
 			completed = append(completed, &list.Items[i])
 		}
 	}
-	sort.Slice(completed, func(i, j int) bool {
-		ti, tj := finishedAt(completed[i]), finishedAt(completed[j])
-		if !ti.Equal(tj) {
-			return ti.After(tj)
-		}
-		// finishedAt has second precision; fall back to creation order, then name.
-		ci, cj := completed[i].CreationTimestamp, completed[j].CreationTimestamp
-		if !ci.Equal(&cj) {
-			return cj.Before(&ci)
-		}
-		return completed[i].Name > completed[j].Name
+	// Newest first. finishedAt has second precision; fall back to creation order, then name.
+	slices.SortFunc(completed, func(a, b *syncv1alpha1.ApplicationSync) int {
+		return cmp.Or(
+			finishedAt(b).Compare(finishedAt(a)),
+			b.CreationTimestamp.Compare(a.CreationTimestamp.Time),
+			cmp.Compare(b.Name, a.Name),
+		)
 	})
 	newer := map[string]int{} // completed runs seen so far, newest first, per app
 	for _, c := range completed {

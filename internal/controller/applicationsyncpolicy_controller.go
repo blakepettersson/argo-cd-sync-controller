@@ -348,6 +348,10 @@ func pinFromStatus(spec *syncv1alpha1.ApplicationSyncSpec, apps map[string]*argo
 	}
 }
 
+// policyChangeLength is how many hex characters of the hash policyChange keeps: 64 bits, so two different
+// changes practically never collide, in a value short enough to read in the policy's status.
+const policyChangeLength = 16
+
 // policyChange identifies the revisions and sources the apps are currently compared against.
 func policyChange(names []string, apps map[string]*argov1alpha1.Application) string {
 	type appChange struct {
@@ -364,5 +368,5 @@ func policyChange(names []string, apps map[string]*argov1alpha1.Application) str
 	}
 	b, _ := json.Marshal(changes)
 	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:])[:16]
+	return hex.EncodeToString(sum[:])[:policyChangeLength]
 }
