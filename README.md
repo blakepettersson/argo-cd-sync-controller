@@ -1,21 +1,6 @@
 # argo-cd-sync-controller
 
-A controller that syncs Argo CD Applications in dependency order, driven by two resources:
-
-- **`ApplicationSync`**: a one-off, immutable request to sync groups of Applications. Groups can depend on other
-  groups, and a group starts once the groups it depends on are Synced and Healthy. Create one with
-  `kubectl apply`.
-- **`ApplicationSyncPolicy`**: auto-sync for a group. It creates an ApplicationSync from its template whenever
-  one of its Applications is OutOfSync.
-
-It runs next to an existing Argo CD installation. It never talks to Argo CD's API server or repo server: it sets
-each Application's `operation` the way the Sync API does, and reads the result back from
-`status.operationState`. Argo CD's application controller runs the syncs as usual.
-
-The plan is to move this into Argo CD itself later, so the resources use Argo CD's API group,
-`argoproj.io/v1alpha1`. Then no CRD rename is needed when that happens.
-
-## Example
+Sync groups of Argo CD Applications in dependency order, gated on health.
 
 ```yaml
 apiVersion: argoproj.io/v1alpha1
@@ -24,133 +9,171 @@ metadata:
   name: release-42
   namespace: argocd
 spec:
-  prune: true
   groups:
   - name: data
-    apps:
-    - name: db
+    apps: [{name: db}]
   - name: backend
     dependsOn: [data]
-    apps:
-    - name: api
-    - name: worker
+    apps: [{name: api}, {name: worker}]
   - name: frontend
     dependsOn: [backend]
-    apps:
-    - name: web
+    apps: [{name: web}]
 ```
 
-```bash
-kubectl apply -f release-42.yaml
-kubectl get appsync release-42 -o wide
-```
+`db` syncs first. Once it is Synced and Healthy, `api` and `worker` sync in parallel, then `web`.
 
-A single app is a single group with one entry. A group's `name` defaults to `default`, so it can be left out
-when there is only one group (`groups: [{apps: [{name: guestbook}]}]`). Status is reported per group and per app
-under `status.groups`.
+## Why
 
-## Behavior
+Argo CD has two ways to order syncs across apps today, and both are awkward:
 
-- **No auto-sync.** Applications in an ApplicationSync or an ApplicationSyncPolicy must not have auto-sync
-  enabled. Auto-sync would sync an app ahead of the groups it depends on, or undo a pinned revision. The
-  controller enforces this: an app with auto-sync on fails (or waits, with `onFailure: Wait`) without being
-  synced, and a policy starts no run while any of its apps has it on. To keep a group of apps in sync
-  automatically, use an ApplicationSyncPolicy instead, with `selfHeal` if drift should be reverted. Nothing is
-  read from an app's own `syncPolicy.automated`.
-- **Waiting.** An app that doesn't exist yet waits; the run's message and an `ApplicationWaiting` event say why. An
-  app that already has an operation running fails, as the Sync API rejects it, unless `onFailure: Wait` is set;
-  policy runs always wait for it. An app deleted, or recreated under the same name, after its sync started
-  fails, even with `onFailure: Wait`.
-- **Deadline.** `spec.activeDeadlineSeconds` fails a run that hasn't finished that long after it started, as for a
-  Job: unfinished apps fail, apps in groups that haven't started are Skipped, running operations finish, and nothing
-  new starts.
-- **Health gate.** An app is done once its sync succeeded and it is Synced and Healthy. That status is only
-  trusted once `status.sync.comparedTo` shows the app's current spec, and the controller requests a refresh
-  when it doesn't.
-- **Failures.** When an app fails, the rest of its group finishes, the group fails, and the groups that depend
-  on it are Skipped. With `onFailure: Wait`, a failed or Degraded app keeps its dependents waiting until it
-  recovers.
-- **Sync windows** are enforced. A closed window keeps the app Pending without starting a sync.
-- **Automatic runs.** Only runs owned by an ApplicationSyncPolicy are automatic: sync windows apply to them as to
-  auto-sync, and with prune on, an app whose resources would all be pruned fails without syncing. Every other run
-  is manual.
-- **Immutability.** `spec` is immutable, except `spec.ttlSecondsAfterFinished`. To stop a run, delete it: operations
-  already running finish and nothing new starts.
-- **Suspend.** A policy with `suspend: true` starts no runs, self-heal included, as a suspended CronJob starts no
-  Jobs. A run already going continues; delete it to stop the rollout.
-- **Self-heal.** A policy with `selfHeal: true` starts another run for the same change when an app drifts after a
-  successful run, syncing only the resources that aren't Synced. Runs are spaced by the same
-  `controller.self.heal.*` settings in `argocd-cmd-params-cm` that Argo CD's auto-sync uses. An app the run left
-  OutOfSync, as `doneWhen: Healthy` allows, isn't treated as drift and is left out of self-heal runs.
-- **Observed generation.** Both resources set `status.observedGeneration`, so you can tell when a TTL change or a
-  policy edit has been picked up.
-- **History.** Each app keeps its 20 most recent completed ApplicationSyncs (`--history-limit`); a run is deleted
-  once it is among the newest 20 for none of its apps. `spec.ttlSecondsAfterFinished` also deletes a run that many
-  seconds after it finishes, as for a Job; a policy's latest run is kept until a newer one replaces it.
+- **App-of-apps sync waves** need a parent Application whose only job is ordering, plus the Application health
+  check that was removed in Argo CD 1.8 added back. The order lives in annotations spread across child manifests.
+- **ApplicationSet RollingSync** only works for apps generated by one ApplicationSet, orders them in linear steps
+  picked by label selector, and is driven by the ApplicationSet controller.
 
-| Field | Effect |
-|---|---|
-| `groups[].maxParallel` | How many apps of the group sync at once, as a number or a percentage; at least 1 or 1%. |
-| `groups[].apps[].revisions` | Pins sources, by `source` name or 1-based `position`. Revisions are passed to the sync as given, so use commit SHAs to be sure every app gets the same one. Sources that aren't listed sync to their `targetRevision`. |
-| `groups[].apps[].prune`, `.retry`, `.resources` | Per-app prune, retry and partial sync. |
-| `doneWhen: Healthy` | Healthy is enough; OutOfSync doesn't block. |
-| `skipIfSynced: true` | Apps that are already Synced aren't synced again. |
-| `allowEmpty: true` | Lets an automatic run with prune delete every resource of an app, like `automated.allowEmpty`. An app with no resources never needs it. |
+Neither gives you a record of a release. Argo CD only keeps successful syncs, per app, so nothing says which syncs
+went out together or which one failed.
 
-## Authorization
+This controller adds:
 
-Creating an `ApplicationSync` needs Kubernetes RBAC `create` on `applicationsyncs` in the apps' namespace. That
-is equivalent to granting sync on every Application in that namespace. Argo CD RBAC is not consulted, the same as
-for writing `operation` with kubectl today. With `application.sync.requireOverridePrivilegeForRevisionSync` set in
-`argocd-cm`, a pin must name `targetRevision`, or the revision the app last resolved it to.
+- **`ApplicationSync`**: a one-off sync request for any apps in a namespace, with groups ordered by `dependsOn`
+  (a DAG, not just steps), optional per-app revision pins, and per-group and per-app status. Finished runs are kept
+  as history, so rolling back is creating a new run with the previous revisions.
+- **`ApplicationSyncPolicy`**: auto-sync for a group. When an app goes OutOfSync, it creates an ApplicationSync from
+  its template, so the group syncs in order instead of each app on its own.
 
-## Differences from running inside Argo CD
+Requests are Kubernetes objects, so you can apply, commit or template them instead of patching `operation` onto an
+Application that is itself managed from Git.
 
-A prototype of this ran inside Argo CD's application controller. Running outside it means:
+It runs next to an existing Argo CD and only talks to the Kubernetes API: it sets `Application.operation` like the
+Sync API does, and Argo CD's application controller runs the sync. The CRDs use `argoproj.io/v1alpha1` because
+the plan is to move this into Argo CD proper.
 
-- **Revisions are passed as given.** There is no repo-server access to resolve a branch to a commit.
-- **Syncs from Argo CD's API and UI aren't recorded** as ApplicationSyncs, and ApplicationSet RollingSync is not
-  replaced.
-
-## Installing
+## Install
 
 ```bash
 kubectl apply --server-side -k config/default   # into the argocd namespace
 ```
 
-This installs `ghcr.io/blakepettersson/argo-cd-sync-controller:latest`, the newest release. Each `v*` tag is
-published there as an image for `linux/amd64` and `linux/arm64`; `make image` builds one locally.
+Installs `quay.io/argoproj-labs/argo-cd-sync-controller:latest` (`linux/amd64`, `linux/arm64`).
+
+## Usage
+
+### Turn off auto-sync
+
+Apps managed by this controller must not have `spec.syncPolicy.automated`: Argo CD would sync them out of order or
+undo a pinned revision. The controller refuses such apps. Use an `ApplicationSyncPolicy` instead.
+
+### Run a sync
+
+```bash
+kubectl create -f release-42.yaml
+kubectl get appsync release-42 -o wide
+kubectl get appsync release-42 -o jsonpath='{.status.groups}'
+```
+
+An ApplicationSync is immutable; to cancel it, delete it (running operations finish, nothing new starts). A group's
+`name` defaults to `default`, so a single app is `groups: [{apps: [{name: guestbook}]}]`.
+
+A run's `status.phase` is `Running`, `Succeeded` or `Failed`, and each group and app has its own phase:
+
+- An app is done when its sync succeeded and it is Synced and Healthy.
+- A missing app waits. So does an app outside its sync window.
+- When an app fails, the rest of its group finishes, the group fails, and groups that depend on it are `Skipped`.
+- An app that already has an operation running fails, as with the Sync API.
+
+Set `onFailure: Wait` to have failed, Degraded or busy apps block their dependents until they recover, instead of
+failing the run.
+
+To roll back, copy the revisions from a previous run's `status.groups[].apps[].revisions` into a new run's
+`revisions`.
+
+### Auto-sync a group
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSyncPolicy
+metadata:
+  name: guestbooks
+  namespace: argocd
+spec:
+  selfHeal: true
+  template:
+    prune: true
+    skipIfSynced: true
+    groups:
+    - name: first
+      apps: [{name: guestbook}]
+    - name: rest
+      dependsOn: [first]
+      apps: [{name: helm-guestbook}, {name: kustomize-guestbook}]
+```
+
+A policy starts a run when an app goes `OutOfSync`, pinned to the revisions Argo CD compared against, and doesn't
+retry the same change once it has run. Policy runs behave like auto-sync: sync windows apply, and with `prune`, an
+app whose resources would all be deleted fails unless `allowEmpty: true`.
+
+- `selfHeal: true` starts a new run when an app drifts after a successful run, syncing only the resources that
+  aren't Synced. Backoff uses `controller.self.heal.*` in `argocd-cmd-params-cm`.
+- `concurrencyPolicy: Forbid` (default) waits for the current run to finish; `Replace` deletes it and starts over.
+- `suspend: true` stops new runs. A run in progress continues.
+
+### Fields
+
+`ApplicationSync.spec`, and a policy's `spec.template`:
+
+| Field | Effect |
+|---|---|
+| `prune`, `dryRun`, `syncOptions`, `syncStrategy`, `retry` | As for an Argo CD sync, applied to every app. |
+| `groups[].dependsOn` | Groups that must finish first. |
+| `groups[].maxParallel` | Apps synced at once in the group, as a number or percentage. |
+| `groups[].apps[].revisions` | Pins sources, by `source` name or 1-based `position`. Branches aren't resolved, so use commit SHAs to get the same commit everywhere. Unlisted sources use `targetRevision`. |
+| `groups[].apps[].prune`, `.retry`, `.resources` | Per-app prune, retry and partial sync. |
+| `onFailure` | `Fail` (default) or `Wait`. |
+| `doneWhen` | `SyncedAndHealthy` (default) or `Healthy`, for apps that stay OutOfSync. |
+| `skipIfSynced` | Don't sync apps that are already Synced. |
+| `allowEmpty` | Let a policy run with prune delete all of an app's resources. |
+| `activeDeadlineSeconds` | Fail the run if it hasn't finished in time. Unstarted groups are Skipped. |
+| `ttlSecondsAfterFinished` | Delete the run this long after it finishes. The only mutable field. |
+
+Each app keeps its 20 newest finished runs (`--history-limit`); older ones are deleted.
+
+## Permissions
+
+Creating an `ApplicationSync` needs Kubernetes RBAC `create` on `applicationsyncs`, which amounts to sync on every
+Application in that namespace. Argo CD RBAC isn't checked, same as setting `operation` with kubectl. With
+`application.sync.requireOverridePrivilegeForRevisionSync` in `argocd-cm`, a pin must be the app's
+`targetRevision` or the revision it last resolved to.
+
+## Limitations
+
+- Branches and tags in `revisions` aren't resolved to commits; there is no repo-server access.
+- Syncs started from Argo CD's UI, CLI or API aren't recorded as ApplicationSyncs.
+- One ApplicationSync only covers apps in its own namespace.
 
 ## Development
 
-The project is meant to move into Argo CD, so it follows Argo CD's conventions: the same `.golangci.yaml`,
-the same `make` target names, the same CI checks, and semantic PR titles (`feat:`, `fix:`, `docs:`, ...).
+Follows Argo CD's conventions (`.golangci.yaml`, `make` targets, CI, semantic PR titles) so it can move there
+unchanged.
 
 ```bash
-make codegen-local        # deepcopy, CRDs and ClusterRole from the kubebuilder markers
+make codegen-local        # deepcopy, CRDs, ClusterRole
 make build-local
-make lint-local           # golangci-lint with Argo CD's config, applying fixes
-make test-local           # everything but test/e2e; TEST_MODULE=./internal/controller for one package
-make test-e2e-local       # e2e suite against Argo CD in a throwaway k3s container; needs Docker and git
-make pre-commit-local     # all of the above; run it before committing
+make lint-local           # golangci-lint with --fix
+make test-local           # all but test/e2e; TEST_MODULE=./internal/controller for one package
+make test-e2e-local       # e2e in a k3s container; needs Docker and git
+make pre-commit-local     # all of the above
 ```
 
-### Running everything locally
-
-Like Argo CD's `make start-local`, this runs the processes in `Procfile` with
-[goreman](https://github.com/mattn/goreman):
+Run locally:
 
 ```bash
-make start-test-k8s       # k3d cluster with the Argo CD release from go.mod, and the CRDs
-make start-local          # the controller, and the Argo CD UI on https://localhost:8443
-kubectl apply -k config/samples                          # example Applications, auto-sync off
+make start-test-k8s       # k3d cluster with Argo CD (version from go.mod) and the CRDs
+make start-local          # controller + Argo CD UI on https://localhost:8443 (via goreman)
+kubectl apply -k config/samples
 kubectl create -n argocd -f config/samples/applicationsync.yaml
 ```
 
-To run against Argo CD built from source instead, start it with `make start-local` in an argo-cd checkout, then
-run only the controller here with `make start-local START=controller`. The controller's metrics and probes
-listen on `:18080` and `:18081`, so they don't clash with Argo CD's ports. `ARGOCD_APPLICATION_NAMESPACES` is
-passed to the controller's `--namespaces`, as for Argo CD.
-
-It depends on Argo CD v3.6.0 for its API types, and on the matching `gitops-engine/v3` release. `go.mod` repeats
-Argo CD's replace directives, which don't carry over to modules that import it.
+Against Argo CD built from source: run `make start-local` in argo-cd, then `make start-local START=controller`
+here. Metrics and probes listen on `:18080`/`:18081`. `ARGOCD_APPLICATION_NAMESPACES` is passed as
+`--namespaces`.
