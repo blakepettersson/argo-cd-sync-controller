@@ -19,6 +19,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	syncv1alpha1 "github.com/argoproj-labs/argo-cd-sync-controller/api/v1alpha1"
@@ -462,6 +463,10 @@ func (r *ApplicationSyncReconciler) reconcileApp(ctx context.Context, s *syncv1a
 			st.Message = "waiting for the cache to catch up with a recreated application"
 			return
 		}
+		if unread := (*unreadResultError)(nil); errors.As(err, &unread) {
+			st.Message = unread.Error()
+			return
+		}
 		if errors.Is(err, errAnotherOperationInProgress) {
 			// As the Sync API does, a busy app is a failed start, so onFailure decides whether to wait. A policy
 			// doesn't retry a failed change, so its runs always wait.
@@ -720,7 +725,13 @@ func (r *ApplicationSyncReconciler) startOperation(ctx context.Context, s *syncv
 	if live.UID != s.UID || live.DeletionTimestamp != nil {
 		return errApplicationSyncGone
 	}
-	if err := argo.setOperation(ctx, s, app.Namespace, app.Name, app.UID, &op); errors.Is(err, errOperationAlreadySet) {
+	canReplace := func(live *argov1alpha1.Application) error {
+		if run := r.unreadRun(ctx, s, live); run != "" {
+			return &unreadResultError{run: run}
+		}
+		return nil
+	}
+	if err := argo.setOperation(ctx, s, app.Namespace, app.Name, app.UID, &op, canReplace); errors.Is(err, errOperationAlreadySet) {
 		return nil
 	} else if err != nil {
 		return err
@@ -745,6 +756,59 @@ func operationStateFor(s *syncv1alpha1.ApplicationSync, app *argov1alpha1.Applic
 func isAutomated(s *syncv1alpha1.ApplicationSync) bool {
 	owner := metav1.GetControllerOf(s)
 	return owner != nil && owner.APIVersion == syncv1alpha1.GroupVersion.String() && owner.Kind == "ApplicationSyncPolicy"
+}
+
+// unreadResultError means app's operationState holds another run's result that the run hasn't read yet.
+type unreadResultError struct{ run string }
+
+func (e *unreadResultError) Error() string {
+	return fmt.Sprintf("waiting for ApplicationSync %q to read the result of its sync", e.run)
+}
+
+// unreadRun returns the name of another unfinished ApplicationSync whose finished operation is still app's
+// operationState and that hasn't read its result yet. Starting a sync would replace that state and fail the app in
+// the other run, although its sync may have succeeded. That run is read live, since one created moments ago may
+// not be cached yet. Its operation proves it started the sync, so a status showing the app Pending, or not at all,
+// is from a pass that failed to persist Running: until it is past Running, the result is unread.
+func (r *ApplicationSyncReconciler) unreadRun(ctx context.Context, s *syncv1alpha1.ApplicationSync, app *argov1alpha1.Application) string {
+	state := app.Status.OperationState
+	// An operation still in progress makes the app busy, which setOperation reports as the Sync API does.
+	if state == nil || !state.Phase.Completed() || isOperationFor(s, &state.Operation) {
+		return ""
+	}
+	var name, uid string
+	for _, i := range state.Operation.Info {
+		switch {
+		case i == nil:
+		case i.Name == syncv1alpha1.ApplicationSyncOperationInfoName:
+			name = i.Value
+		case i.Name == syncv1alpha1.ApplicationSyncOperationUIDInfoName:
+			uid = i.Value
+		}
+	}
+	if name == "" || uid == "" {
+		return ""
+	}
+	var other syncv1alpha1.ApplicationSync
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: app.Namespace, Name: name}, &other); err != nil {
+		// A deleted run reads nothing; on any other error, wait and look again on the next pass.
+		if apierrors.IsNotFound(err) {
+			return ""
+		}
+		log.FromContext(ctx).V(1).Info("Reading the ApplicationSync that owns an operation", "applicationSync", name, "error", err.Error())
+		return name
+	}
+	if string(other.UID) != uid || other.Status.Phase.Completed() {
+		return ""
+	}
+	for _, g := range other.Status.Groups {
+		for _, a := range g.Apps {
+			if a.Name == app.Name && a.Phase != syncv1alpha1.ApplicationSyncPhasePending && a.Phase != syncv1alpha1.ApplicationSyncPhaseRunning {
+				return ""
+			}
+		}
+	}
+	return name
 }
 
 func isOperationFor(s *syncv1alpha1.ApplicationSync, op *argov1alpha1.Operation) bool {

@@ -169,9 +169,9 @@ func (a *argoCD) replaceAllowed(ctx context.Context) (bool, error) {
 
 // setOperation writes s's op on the live app, as the Sync API does: it fails if an operation is already set, and
 // clears the previous operationState in the same update. It also fails if the live app isn't the one with uid that
-// the caller checked. If the live app already has s's operation, or its result, from a pass whose status update
-// failed, it returns errOperationAlreadySet.
-func (a *argoCD) setOperation(ctx context.Context, s *syncv1alpha1.ApplicationSync, namespace, name string, uid types.UID, op *argov1alpha1.Operation) error {
+// the caller checked, or if canReplace rejects the live app's operationState. If the live app already has s's
+// operation, or its result, from a pass whose status update failed, it returns errOperationAlreadySet.
+func (a *argoCD) setOperation(ctx context.Context, s *syncv1alpha1.ApplicationSync, namespace, name string, uid types.UID, op *argov1alpha1.Operation, canReplace func(*argov1alpha1.Application) error) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		app, err := a.getLiveApp(ctx, namespace, name)
 		if err != nil {
@@ -185,6 +185,9 @@ func (a *argoCD) setOperation(ctx context.Context, s *syncv1alpha1.ApplicationSy
 		}
 		if app.Operation != nil {
 			return errAnotherOperationInProgress
+		}
+		if err := canReplace(app); err != nil {
+			return err
 		}
 		app.Operation = op
 		app.Status.OperationState = nil

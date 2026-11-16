@@ -1152,3 +1152,81 @@ func TestTTLSecondsAfterFinished(t *testing.T) {
 		assert.False(t, exists(t, r, s))
 	})
 }
+
+// TestWaitsForOtherRunToReadResult covers two runs listing the same app: the second must not replace the first
+// run's finished operationState before the first has read it, or the first fails an app whose sync succeeded.
+func TestWaitsForOtherRunToReadResult(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// deleteFirst deletes the first run before the second one's pass, so nobody is left to read the result.
+		deleteFirst bool
+		// rewindFirst rewinds the first run's status, as when the pass that set its operation failed to persist it.
+		rewindFirst func(*syncv1alpha1.ApplicationSyncStatus)
+		// staleAppCache serves the second run a cached app from before the first run's operation finished.
+		staleAppCache bool
+	}{
+		{name: "waits until the first run has read its result"},
+		{name: "waits while the cached app hasn't caught up", staleAppCache: true},
+		{name: "waits when the first run's status still shows the app Pending", rewindFirst: func(st *syncv1alpha1.ApplicationSyncStatus) {
+			st.Groups[0].Apps[0].Phase = syncv1alpha1.ApplicationSyncPhasePending
+		}},
+		{name: "waits when the first run has no status yet", rewindFirst: func(st *syncv1alpha1.ApplicationSyncStatus) {
+			st.Groups = nil
+		}},
+		{name: "doesn't wait for a deleted run", deleteFirst: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			first := newSync(group("data", nil, "db"))
+			second := newSync(group("data", nil, "db"))
+			second.Name, second.UID = "second", "second-uid"
+			r := newTestReconciler(t, withApps([]client.Object{testProject(nil), first, second}, testApp("db"))...)
+			live := r.Client.(client.WithWatch)
+			secondR := r
+			if tc.staleAppCache {
+				cachedApp := getTestApp(t, r.Client, "db")
+				stale := *r
+				stale.Client = interceptor.NewClient(live, interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					if app, ok := obj.(*argov1alpha1.Application); ok {
+						cachedApp.DeepCopyInto(app)
+						return nil
+					}
+					return c.Get(ctx, key, obj, opts...)
+				}})
+				secondR = &stale
+			}
+			reconcile := func(r *ApplicationSyncReconciler, s *syncv1alpha1.ApplicationSync) *syncv1alpha1.ApplicationSync {
+				t.Helper()
+				_, err := r.Reconcile(t.Context(), ctrlRequest(s))
+				require.NoError(t, err)
+				var got syncv1alpha1.ApplicationSync
+				require.NoError(t, live.Get(t.Context(), client.ObjectKeyFromObject(s), &got))
+				return &got
+			}
+
+			require.Equal(t, syncv1alpha1.ApplicationSyncPhaseRunning, appStatus(t, reconcile(r, first), "db").Phase)
+			finishOperation(t, live, "db", synccommon.OperationSucceeded, health.HealthStatusHealthy)
+			if tc.deleteFirst {
+				require.NoError(t, live.Delete(t.Context(), first))
+				assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseRunning, appStatus(t, reconcile(secondR, second), "db").Phase)
+				return
+			}
+			if tc.rewindFirst != nil {
+				var rewound syncv1alpha1.ApplicationSync
+				require.NoError(t, live.Get(t.Context(), client.ObjectKeyFromObject(first), &rewound))
+				tc.rewindFirst(&rewound.Status)
+				require.NoError(t, live.Status().Update(t.Context(), &rewound))
+			}
+
+			got := reconcile(secondR, second)
+			assert.Equal(t, syncv1alpha1.ApplicationSyncPhasePending, appStatus(t, got, "db").Phase)
+			assert.Equal(t, `waiting for ApplicationSync "rollout" to read the result of its sync`, appStatus(t, got, "db").Message)
+			assert.Nil(t, getTestApp(t, live, "db").Operation, "the first run's result is left in place")
+			if tc.rewindFirst != nil {
+				return
+			}
+
+			assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseSucceeded, appStatus(t, reconcile(r, first), "db").Phase)
+			assert.Equal(t, syncv1alpha1.ApplicationSyncPhaseRunning, appStatus(t, reconcile(r, second), "db").Phase, "once read, the second run starts")
+		})
+	}
+}
