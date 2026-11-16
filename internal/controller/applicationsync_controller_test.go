@@ -128,7 +128,11 @@ func finishOperation(t *testing.T, c client.Client, name string, phase synccommo
 			Phase:      phase,
 			StartedAt:  now,
 			FinishedAt: &now,
-			SyncResult: &argov1alpha1.SyncOperationResult{Revision: "abc123"},
+			SyncResult: &argov1alpha1.SyncOperationResult{Revision: "abc123", Sources: app.Operation.Sync.Sources},
+		}
+		// As Argo CD does, the result records the sources the operation synced.
+		if src := app.Operation.Sync.Source; src != nil {
+			app.Status.OperationState.SyncResult.Source = *src
 		}
 		app.Operation = nil
 		app.Status.ReconciledAt = &now
@@ -392,25 +396,52 @@ func TestOnFailureWait(t *testing.T) {
 }
 
 func TestDoneWhen(t *testing.T) {
+	helmParam := func(app *argov1alpha1.Application) {
+		src := app.Spec.GetSourcePtrByIndex(0)
+		src.Helm = &argov1alpha1.ApplicationSourceHelm{Parameters: []argov1alpha1.HelmParameter{{Name: "replicaCount", Value: "3"}}}
+	}
 	for _, tc := range []struct {
 		name           string
 		doneWhen       syncv1alpha1.ApplicationSyncDoneWhen
+		multiSource    bool
 		syncedRevision string
-		want           syncv1alpha1.ApplicationSyncPhase
+		// changeSpec edits the app after its sync finished.
+		changeSpec func(*argov1alpha1.Application)
+		want       syncv1alpha1.ApplicationSyncPhase
 	}{
-		{"OutOfSync at the synced revision blocks", "", "abc123", syncv1alpha1.ApplicationSyncPhaseProgressing},
-		{"doneWhen Healthy ignores OutOfSync", syncv1alpha1.ApplicationSyncDoneWhenHealthy, "abc123", syncv1alpha1.ApplicationSyncPhaseSucceeded},
-		{"OutOfSync because targetRevision moved on does not block", "", "def456", syncv1alpha1.ApplicationSyncPhaseSucceeded},
+		{name: "OutOfSync at the synced revision blocks", syncedRevision: "abc123", want: syncv1alpha1.ApplicationSyncPhaseProgressing},
+		{name: "OutOfSync at the synced revision blocks a multi-source app", multiSource: true, syncedRevision: "abc123", want: syncv1alpha1.ApplicationSyncPhaseProgressing},
+		{name: "doneWhen Healthy ignores OutOfSync", doneWhen: syncv1alpha1.ApplicationSyncDoneWhenHealthy, syncedRevision: "abc123", want: syncv1alpha1.ApplicationSyncPhaseSucceeded},
+		{name: "OutOfSync because targetRevision moved on does not block", syncedRevision: "def456", want: syncv1alpha1.ApplicationSyncPhaseSucceeded},
+		{name: "OutOfSync because the sources changed after the sync does not block", syncedRevision: "abc123", changeSpec: helmParam, want: syncv1alpha1.ApplicationSyncPhaseSucceeded},
+		{name: "OutOfSync because the sources changed does not block a multi-source app", multiSource: true, syncedRevision: "abc123", changeSpec: helmParam, want: syncv1alpha1.ApplicationSyncPhaseSucceeded},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newTestReconciler(t, withApps([]client.Object{testProject(nil)}, testApp("db"))...)
+			if tc.multiSource {
+				updateTestApp(t, r.Client, "db", func(app *argov1alpha1.Application) {
+					app.Spec.Sources = argov1alpha1.ApplicationSources{*app.Spec.Source}
+					app.Spec.Source = nil
+					app.Status.Sync.ComparedTo = app.Spec.BuildComparedToStatus(app.Spec.GetSources())
+				})
+			}
 			s := newSync(group("data", nil, "db"))
 			s.Spec.DoneWhen = tc.doneWhen
 			reconcileSync(t, r, s)
 			finishOperation(t, r.Client, "db", synccommon.OperationSucceeded, health.HealthStatusHealthy)
 			updateTestApp(t, r.Client, "db", func(app *argov1alpha1.Application) {
+				if tc.changeSpec != nil {
+					tc.changeSpec(app)
+					// Argo CD has compared the app against its new spec.
+					app.Status.Sync.ComparedTo = app.Spec.BuildComparedToStatus(app.Spec.GetSources())
+				}
 				app.Status.Sync.Status = argov1alpha1.SyncStatusCodeOutOfSync
 				app.Status.Sync.Revision = tc.syncedRevision
+				app.Status.Sync.Revisions = nil
+				if tc.multiSource {
+					app.Status.Sync.Revision = ""
+					app.Status.Sync.Revisions = []string{tc.syncedRevision}
+				}
 			})
 			reconcileSync(t, r, s)
 			assert.Equal(t, tc.want, appStatus(t, s, "db").Phase)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -569,9 +570,9 @@ func (r *ApplicationSyncReconciler) reconcileApp(ctx context.Context, s *syncv1a
 			return
 		}
 		if s.Spec.DoneWhen != syncv1alpha1.ApplicationSyncDoneWhenHealthy && app.Status.Sync.Status != argov1alpha1.SyncStatusCodeSynced &&
-			(len(st.Revisions) == 0 || revisionsMatch(st.Revisions, app.Status.GetRevisions())) {
+			(len(st.Revisions) == 0 || revisionsMatch(st.Revisions, app.Status.GetRevisions())) && !sourcesChangedSince(s, app) {
 			// OutOfSync only blocks while the comparison is still against what was synced. If targetRevision
-			// moved on, whoever created the ApplicationSync decides whether to start another run.
+			// or the sources moved on, whoever created the ApplicationSync decides whether to start another run.
 			st.Message = fmt.Sprintf("waiting for application to become Synced (currently %s)", app.Status.Sync.Status)
 			return
 		}
@@ -590,6 +591,19 @@ func (r *ApplicationSyncReconciler) isFresh(ctx context.Context, app *argov1alph
 		r.argoCD().requestRefresh(ctx, app)
 	}
 	return fresh
+}
+
+// sourcesChangedSince reports whether app's sources differ from the ones its sync for s used, the comparison
+// Argo CD's auto-sync makes before retrying a change. It is false when the sync's result is no longer on the app.
+func sourcesChangedSince(s *syncv1alpha1.ApplicationSync, app *argov1alpha1.Application) bool {
+	state := operationStateFor(s, app)
+	if state == nil || state.SyncResult == nil {
+		return false
+	}
+	if app.Spec.HasMultipleSources() {
+		return !reflect.DeepEqual(app.Spec.Sources, state.SyncResult.Sources)
+	}
+	return !reflect.DeepEqual(app.Spec.GetSource(), state.SyncResult.Source)
 }
 
 // revisionsMatch reports whether actual agrees with want on every source want sets.
