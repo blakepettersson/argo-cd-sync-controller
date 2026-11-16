@@ -26,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	syncv1alpha1 "github.com/argoproj-labs/argo-cd-sync-controller/api/v1alpha1"
 )
@@ -1182,4 +1183,45 @@ func TestTTLSecondsAfterFinished(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, exists(t, r, s))
 	})
+}
+
+// TestReconcileRetriesConflicts covers a status write that loses a race, as when the cache lags behind the
+// controller's own last write: it is requeued without an error, while other write errors are still returned.
+func TestReconcileRetriesConflicts(t *testing.T) {
+	errServer := apierrors.NewInternalError(errors.New("etcd unavailable"))
+	tests := []struct {
+		name      string
+		updateErr error
+		wantErr   bool
+	}{
+		{name: "conflict", updateErr: apierrors.NewConflict(syncv1alpha1.GroupVersion.WithResource("x").GroupResource(), "x", errors.New("the object has been modified"))},
+		{name: "other error", updateErr: errServer, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newSync(group("data", nil, "db"))
+			p := newTestPolicy("")
+			base := newTestReconciler(t, withApps([]client.Object{testProject(nil), s, p}, testApp("db"), testApp("api"))...)
+			failing := interceptor.NewClient(base.Client.(client.WithWatch), interceptor.Funcs{
+				SubResourceUpdate: func(context.Context, client.Client, string, client.Object, ...client.SubResourceUpdateOption) error {
+					return tt.updateErr
+				},
+			})
+
+			reconcilers := map[string]reconcile.Reconciler{
+				"ApplicationSync":       &ApplicationSyncReconciler{Client: failing, APIReader: base.APIReader, ArgoCDNamespace: testNamespace, HistoryLimit: 20},
+				"ApplicationSyncPolicy": &ApplicationSyncPolicyReconciler{Client: failing, APIReader: base.APIReader, ArgoCDNamespace: testNamespace},
+			}
+			objs := map[string]client.Object{"ApplicationSync": s, "ApplicationSyncPolicy": p}
+			for kind, r := range reconcilers {
+				res, err := r.Reconcile(t.Context(), ctrlRequest(objs[kind]))
+				if tt.wantErr {
+					require.ErrorIs(t, err, errServer, kind)
+					continue
+				}
+				require.NoError(t, err, kind)
+				assert.Equal(t, conflictRequeueDelay, res.RequeueAfter, kind)
+			}
+		})
+	}
 }

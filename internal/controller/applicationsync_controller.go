@@ -20,6 +20,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	syncv1alpha1 "github.com/argoproj-labs/argo-cd-sync-controller/api/v1alpha1"
@@ -30,6 +31,9 @@ const (
 	appIndex = "spec.groups.apps.name"
 	// resyncPeriod is a safety net; app changes wake an ApplicationSync straight away.
 	resyncPeriod = 30 * time.Second
+	// conflictRequeueDelay is how soon a reconcile whose write lost a race reruns: the informer cache usually has
+	// the newer version by then.
+	conflictRequeueDelay = time.Second
 	// waitingForAppMessage is the wait that only ends if someone creates the app, so its event is a warning.
 	waitingForAppMessage = "waiting for application to exist"
 	// Routine waits, which recordWaits doesn't report: they are expected, and would emit an event per app.
@@ -92,7 +96,23 @@ func (r *ApplicationSyncReconciler) syncsForApp(ctx context.Context, obj client.
 	return reqs
 }
 
+// retryOnConflict requeues a reconcile that failed on a stale resourceVersion instead of returning the error.
+// Conflicts are routine when the cache lags behind the controller's own writes, and the rerun succeeds, so they
+// shouldn't be logged as reconciler errors.
+func retryOnConflict(ctx context.Context, res ctrl.Result, err error) (ctrl.Result, error) {
+	if apierrors.IsConflict(err) {
+		log.FromContext(ctx).V(1).Info("Retrying after a conflict", "error", err.Error())
+		return ctrl.Result{RequeueAfter: conflictRequeueDelay}, nil
+	}
+	return res, err
+}
+
 func (r *ApplicationSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	res, err := r.reconcile(ctx, req)
+	return retryOnConflict(ctx, res, err)
+}
+
+func (r *ApplicationSyncReconciler) reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var s syncv1alpha1.ApplicationSync
 	if err := r.Get(ctx, req.NamespacedName, &s); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)

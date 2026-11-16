@@ -80,6 +80,11 @@ func (r *ApplicationSyncPolicyReconciler) policiesForApp(ctx context.Context, ob
 }
 
 func (r *ApplicationSyncPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	res, err := r.reconcile(ctx, req)
+	return retryOnConflict(ctx, res, err)
+}
+
+func (r *ApplicationSyncPolicyReconciler) reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var p syncv1alpha1.ApplicationSyncPolicy
 	if err := r.Get(ctx, req.NamespacedName, &p); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
