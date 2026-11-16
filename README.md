@@ -77,7 +77,8 @@ An ApplicationSync is immutable; to cancel it, delete it (running operations fin
 
 A run's `status.phase` is `Running`, `Succeeded` or `Failed`, and each group and app has its own phase:
 
-- An app is done when its sync succeeded and it is Synced and Healthy.
+- An app is done when its sync succeeded and it is Synced and Healthy. If its spec or `targetRevision` changes
+  after the sync, Healthy is enough: the change is left for the next run.
 - A missing app waits. So does an app outside its sync window.
 - When an app fails, the rest of its group finishes, the group fails, and groups that depend on it are `Skipped`.
 - An app that already has an operation running fails, as with the Sync API.
