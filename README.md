@@ -80,7 +80,8 @@ A run's `status.phase` is `Running`, `Succeeded` or `Failed`, and each group and
 - An app is done when its sync succeeded and it is Synced and Healthy.
 - A missing app waits. So does an app outside its sync window.
 - When an app fails, the rest of its group finishes, the group fails, and groups that depend on it are `Skipped`.
-- An app that already has an operation running fails, as with the Sync API.
+- An app that already has an operation running fails, as with the Sync API. If another run's sync of the app has
+  finished but that run hasn't recorded the result yet, the app waits for it.
 
 Set `onFailure: Wait` to have failed, Degraded or busy apps block their dependents until they recover, instead of
 failing the run.
